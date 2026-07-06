@@ -159,10 +159,12 @@ export class MoveOverlay implements Component, Focusable {
 	#selectedIndex = 0;
 	#results: DirEntry[] = [];
 	#cwd: string;
+	#title: string;
 	#done: (result: MoveOverlayResult | undefined) => void;
 
-	constructor(cwd: string, done: (result: MoveOverlayResult | undefined) => void) {
+	constructor(cwd: string, done: (result: MoveOverlayResult | undefined) => void, title = "Move to directory") {
 		this.#cwd = cwd;
+		this.#title = title;
 		this.#done = done;
 		// Warm the cache for the current directory so the first keystroke is instant.
 		readDirCached(cwd);
@@ -233,7 +235,7 @@ export class MoveOverlay implements Component, Focusable {
 		const w = width;
 		const lines: string[] = [];
 
-		lines.push(topBorder(w, "Move to directory"));
+		lines.push(topBorder(w, this.#title));
 		lines.push(row(this.#renderInput(), w));
 		lines.push(row("", w));
 

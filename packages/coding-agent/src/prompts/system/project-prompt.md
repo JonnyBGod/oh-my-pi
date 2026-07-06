@@ -41,6 +41,22 @@ Working directory layout (sorted by mtime, recent first; depth ≤ 3):
 {{/if}}
 {{/if}}
 
+{{#if additionalWorkspaceRoots.length}}
+<workspace-roots>
+This session's workspace also spans the additional directories below. This list is the CURRENT workspace state and supersedes any workspace changes mentioned earlier in the conversation. `grep`/`glob` cover all workspace directories by default; relative paths resolve against the working directory first, then fall back to a unique match in another workspace directory. Use absolute paths to target one root explicitly.
+{{#each additionalWorkspaceRoots}}
+<root path="{{path}}">
+{{#if rendered}}
+{{rendered}}
+{{#if truncated}}
+(some entries elided — use `glob`/`read` to drill in)
+{{/if}}
+{{/if}}
+</root>
+{{/each}}
+</workspace-roots>
+{{/if}}
+
 Today is {{date}}, and the current working directory is '{{cwd}}'.
 
 <critical>

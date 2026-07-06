@@ -32,6 +32,12 @@ export interface SessionHeader {
 	titleSource?: SessionTitleSource;
 	timestamp: string;
 	cwd: string;
+	/**
+	 * Ordered workspace directories beyond `cwd` (absolute, normalized).
+	 * Absent for single-root sessions; the effective workspace is always
+	 * `[cwd, ...additionalDirectories]`.
+	 */
+	additionalDirectories?: string[];
 	parentSession?: string;
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
 	providerPromptCacheKey?: string;

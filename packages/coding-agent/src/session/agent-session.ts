@@ -251,6 +251,7 @@ import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { IrcBus, type IrcMessage } from "../irc/bus";
+import { shutdownClientsForRoot } from "../lsp/client";
 import { resolveMemoryBackend } from "../memory-backend";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
@@ -1886,6 +1887,7 @@ export class AgentSession {
 	#exitRecorded = false;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
+	#unsubscribeWorkspaceLsp?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
 	#eventListeners: AgentSessionEventListener[] = [];
@@ -2927,6 +2929,18 @@ export class AgentSession {
 			if (!this.#advisorEnabled || this.#isDisposed) return;
 			if (this.#advisors.length > 0 && !this.#advisorRuntimeMatchesCurrentConfig()) this.#stopAdvisorRuntime();
 			this.#buildAdvisorRuntime(true);
+		});
+		// Tear down LSP clients for roots dropped from the workspace mid-session
+		// (`/remove-dir`). Adds are left to lazy spawn on first use. LSP clients
+		// are module-global and keyed by root, so this only needs the removed set.
+		this.#unsubscribeWorkspaceLsp = this.sessionManager.onWorkspaceDirectoriesChanged((previous, next) => {
+			const retained = new Set(next);
+			for (const root of previous) {
+				if (retained.has(root)) continue;
+				void shutdownClientsForRoot(root).catch(err => {
+					logger.debug("LSP: workspace-root client shutdown failed", { root, error: String(err) });
+				});
+			}
 		});
 	}
 	// -------------------------------------------------------------------------
@@ -6940,6 +6954,10 @@ export class AgentSession {
 		if (this.#unsubscribeModelRoles) {
 			this.#unsubscribeModelRoles();
 			this.#unsubscribeModelRoles = undefined;
+		}
+		if (this.#unsubscribeWorkspaceLsp) {
+			this.#unsubscribeWorkspaceLsp();
+			this.#unsubscribeWorkspaceLsp = undefined;
 		}
 		this.#eventListeners = [];
 	}

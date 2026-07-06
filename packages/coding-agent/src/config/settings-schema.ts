@@ -493,6 +493,15 @@ export const SETTINGS_SCHEMA = {
 
 	extensions: { type: "array", default: EMPTY_STRING_ARRAY },
 
+	/**
+	 * Config-provided workspace roots (RFC R1 source 2). Merged additively into
+	 * the session workspace at creation, after any persisted directories and
+	 * before CLI `--add-dir` entries; relative entries resolve against the
+	 * session cwd. Project-level settings suit repo-intrinsic companions
+	 * (seed ↔ project); user-level settings suit personal repo combos.
+	 */
+	"workspace.additionalDirectories": { type: "array", default: EMPTY_STRING_ARRAY },
+
 	enabledModels: { type: "array", default: EMPTY_STRING_ARRAY },
 
 	disabledProviders: { type: "array", default: EMPTY_STRING_ARRAY },

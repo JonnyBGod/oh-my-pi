@@ -143,6 +143,11 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/**
+	 * Ordered workspace directories (`cwd` first). Informational in Phase 1:
+	 * tools stay cwd-scoped by default; workspace-wide behavior is opt-in.
+	 */
+	directories?: string[];
 	/** Whether UI is available */
 	hasUI: boolean;
 	/**

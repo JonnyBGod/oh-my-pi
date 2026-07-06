@@ -24,7 +24,17 @@ import {
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAgentDir, getProjectDir, logger, postmortem, prompt, Snowflake } from "@oh-my-pi/pi-utils";
+import {
+	$env,
+	$flag,
+	directoryExists,
+	getAgentDir,
+	getProjectDir,
+	logger,
+	postmortem,
+	prompt,
+	Snowflake,
+} from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
 	discoverAdvisorConfigs,
@@ -541,6 +551,13 @@ export interface CreateAgentSessionOptions {
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
 
+	/**
+	 * Workspace directories beyond cwd to ADD to the session (CLI `--add-dir`).
+	 * Applied additively after the session manager resolves, so resumed sessions
+	 * keep their persisted workspace and gain these on top.
+	 */
+	additionalDirectories?: string[];
+
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
 
@@ -824,6 +841,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	/** Session workspace directories beyond cwd (ordered, absolute). */
+	additionalDirectories?: string[];
 	customPrompt?: string;
 	appendPrompt?: string;
 	inlineToolDescriptors?: boolean;
@@ -840,6 +859,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const toolMap = options.tools ? new Map(options.tools.map(tool => [tool.name, tool])) : undefined;
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		additionalDirectories: options.additionalDirectories,
 		customPrompt: options.customPrompt,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
@@ -1309,6 +1329,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
+	// Workspace root merge order (RFC R1): persisted session directories, then
+	// settings-configured roots (project settings over user settings via the
+	// normal settings layering), then explicit CLI/embedding-provided entries.
+	// Normalization dedupes, so re-applying on resume is idempotent.
+	const configuredDirectories = settings.get("workspace.additionalDirectories");
+	const startupDirectories = [...configuredDirectories, ...(options.additionalDirectories ?? [])];
+	if (startupDirectories.length > 0) {
+		sessionManager.setAdditionalDirectories([...sessionManager.getDirectories().slice(1), ...startupDirectories]);
+		for (const directory of sessionManager.getDirectories().slice(1)) {
+			if (!(await directoryExists(directory))) {
+				logger.warn("Configured workspace directory does not exist", { directory });
+			}
+		}
+	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const forkCacheShapeChanged =
 		options.model !== undefined ||
@@ -1655,6 +1689,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
+			get directories() {
+				return sessionManager.getDirectories();
+			},
 			hasUI: options.hasUI ?? false,
 			enableLsp,
 			enableIrc: restrictToolNames ? false : options.enableIrc,
@@ -2520,6 +2557,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				xdevTools: toolSession.xdevRegistry?.entries() ?? [],
 				xdevDocs: toolSession.xdevRegistry?.docsAll() ?? "",
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
+				additionalDirectories: sessionManager.getDirectories().slice(1),
 				resolvedCustomPrompt: options.customSystemPrompt,
 				skills: session?.skills ?? skills,
 				contextFiles,
@@ -2882,6 +2920,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			...toolSession,
 			get cwd() {
 				return sessionManager.getCwd();
+			},
+			get directories() {
+				return sessionManager.getDirectories();
 			},
 			hasEditTool: true,
 			requireYieldTool: false,

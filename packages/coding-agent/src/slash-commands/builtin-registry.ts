@@ -34,6 +34,7 @@ import { extractLastCodeBlock, extractLastCommand } from "../modes/utils/copy-ta
 import type { AgentSession, FreshSessionResult } from "../session/agent-session";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { resolveResumableSession } from "../session/session-listing";
+import type { SessionManager } from "../session/session-manager";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { expandTilde, resolveToCwd } from "../tools/path-utils";
 import { urlHyperlinkAlways } from "../tui";
@@ -201,6 +202,96 @@ function parseShakeMode(args: string): ShakeMode | { error: string } {
 	if (verb === "" || verb === "elide") return "elide";
 	if (verb === "images") return "images";
 	return { error: `Unknown /shake mode "${verb}". Use elide or images.` };
+}
+
+/**
+ * Persist a model-visible workspace-change marker into the session history.
+ * The system prompt is rebuilt on workspace changes, but models weigh recent
+ * conversation over prompt state — without this entry, earlier turns that
+ * exercised a removed directory keep it "alive" in the model's world model.
+ * An appended entry never wakes the agent (unlike live message injection).
+ */
+function appendWorkspaceChangeNotice(
+	sessionManager: {
+		getDirectories(): string[];
+		appendCustomMessageEntry(type: string, content: string, display: boolean): string;
+	},
+	change: string,
+): void {
+	const [cwd, ...additional] = sessionManager.getDirectories();
+	const lines = [`${cwd} (working directory)`, ...additional];
+	sessionManager.appendCustomMessageEntry(
+		"workspace-changed",
+		`[Workspace changed: ${change}. The session workspace directories are now exactly:\n${lines.map(line => `- ${line}`).join("\n")}\nThis supersedes any workspace state mentioned earlier in the conversation — earlier tool results that used other directories reflect the OLD workspace. When asked which directories are in the workspace, answer with exactly this list.]`,
+		false,
+	);
+}
+
+function formatWorkspaceDirectories(sessionManager: { getDirectories(): string[] }, note?: string): string {
+	const [cwd, ...additional] = sessionManager.getDirectories();
+	const lines = [
+		"Workspace directories:",
+		`  ${cwd} (working directory)`,
+		...additional.map(directory => `  ${directory}`),
+	];
+	return note ? `${note}\n${lines.join("\n")}` : lines.join("\n");
+}
+
+/** Outcome of an add/remove workspace-directory operation, shared by text and TUI handlers. */
+export interface WorkspaceDirOutcome {
+	ok: boolean;
+	message: string;
+}
+
+/**
+ * Add a directory to the session workspace. Shared by `/add-dir`'s text handler
+ * (ACP, `--add-dir`) and its TUI overlay flow so the workspace-changed notice
+ * and system-prompt refresh happen in exactly one place.
+ */
+export async function addWorkspaceDirectory(
+	sessionManager: SessionManager,
+	session: AgentSession,
+	rawPath: string,
+	cwd: string,
+): Promise<WorkspaceDirOutcome> {
+	const resolvedPath = resolveToCwd(rawPath, cwd);
+	try {
+		const stat = await fs.stat(resolvedPath);
+		if (!stat.isDirectory()) return { ok: false, message: `Not a directory: ${resolvedPath}` };
+	} catch {
+		return { ok: false, message: `Directory does not exist: ${resolvedPath}` };
+	}
+	const current = sessionManager.getDirectories();
+	if (current.includes(resolvedPath)) return { ok: false, message: `Already in the workspace: ${resolvedPath}` };
+	sessionManager.setAdditionalDirectories([...current.slice(1), resolvedPath]);
+	// Rebuild so the model's next turn sees the new root's tree and context files.
+	await session.refreshBaseSystemPrompt();
+	appendWorkspaceChangeNotice(sessionManager, `added ${resolvedPath}`);
+	return { ok: true, message: formatWorkspaceDirectories(sessionManager, `Added ${resolvedPath}.`) };
+}
+
+/**
+ * Remove a directory from the session workspace. Shared by `/remove-dir`'s text
+ * handler and its TUI selector flow.
+ */
+export async function removeWorkspaceDirectory(
+	sessionManager: SessionManager,
+	session: AgentSession,
+	rawPath: string,
+	cwd: string,
+): Promise<WorkspaceDirOutcome> {
+	const resolvedPath = resolveToCwd(rawPath, cwd);
+	if (resolvedPath === sessionManager.getCwd()) {
+		return { ok: false, message: "Cannot remove the working directory; use /move to change it." };
+	}
+	const additional = sessionManager.getDirectories().slice(1);
+	if (!additional.includes(resolvedPath)) {
+		return { ok: false, message: `Not a workspace directory: ${resolvedPath}` };
+	}
+	sessionManager.setAdditionalDirectories(additional.filter(entry => entry !== resolvedPath));
+	await session.refreshBaseSystemPrompt();
+	appendWorkspaceChangeNotice(sessionManager, `removed ${resolvedPath}`);
+	return { ok: true, message: formatWorkspaceDirectories(sessionManager, `Removed ${resolvedPath}.`) };
 }
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
@@ -1694,6 +1785,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		acpDescription: "Move the current session to a different directory",
 		inlineHint: "[<path>]",
 		allowArgs: true,
+		dirArgCompletions: true,
 		handle: async (command, runtime) => {
 			if (runtime.session.isStreaming) return usage("Cannot move while streaming.", runtime);
 			if (!command.args) return usage("Usage: /move <path>", runtime);
@@ -1731,6 +1823,96 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			runtime.ctx.editor.addToHistory(command.text);
 			runtime.ctx.editor.setText("");
 			await runtime.ctx.handleMoveCommand(command.args || undefined);
+		},
+	},
+	{
+		name: "add-dir",
+		description: "Add a workspace directory to this session",
+		acpDescription: "Add a workspace directory to this session",
+		inlineHint: "<path>",
+		allowArgs: true,
+		dirArgCompletions: true,
+		handle: async (command, runtime) => {
+			if (!command.args) return usage(formatWorkspaceDirectories(runtime.sessionManager), runtime);
+			const outcome = await addWorkspaceDirectory(
+				runtime.sessionManager,
+				runtime.session,
+				command.args,
+				runtime.cwd,
+			);
+			if (!outcome.ok) return usage(outcome.message, runtime);
+			await runtime.output(outcome.message);
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			const { ctx } = runtime;
+			ctx.editor.addToHistory(command.text);
+			ctx.editor.setText("");
+			// No argument: open the directory-browse overlay (mirrors /move).
+			if (!command.args) {
+				await ctx.handleAddDirCommand();
+				return;
+			}
+			const outcome = await addWorkspaceDirectory(
+				ctx.sessionManager,
+				ctx.session,
+				command.args,
+				ctx.sessionManager.getCwd(),
+			);
+			if (!outcome.ok) {
+				ctx.showError(outcome.message);
+				return;
+			}
+			ctx.showStatus(outcome.message);
+		},
+	},
+	{
+		name: "remove-dir",
+		description: "Remove a workspace directory from this session",
+		acpDescription: "Remove a workspace directory from this session",
+		inlineHint: "<path>",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			if (!command.args) return usage("Usage: /remove-dir <path>", runtime);
+			const outcome = await removeWorkspaceDirectory(
+				runtime.sessionManager,
+				runtime.session,
+				command.args,
+				runtime.cwd,
+			);
+			if (!outcome.ok) return usage(outcome.message, runtime);
+			await runtime.output(outcome.message);
+			return commandConsumed();
+		},
+		handleTui: async (command, runtime) => {
+			const { ctx } = runtime;
+			ctx.editor.addToHistory(command.text);
+			ctx.editor.setText("");
+			// No argument: pick from the current additional roots via a selector.
+			if (!command.args) {
+				await ctx.handleRemoveDirCommand();
+				return;
+			}
+			const outcome = await removeWorkspaceDirectory(
+				ctx.sessionManager,
+				ctx.session,
+				command.args,
+				ctx.sessionManager.getCwd(),
+			);
+			if (!outcome.ok) {
+				ctx.showError(outcome.message);
+				return;
+			}
+			ctx.showStatus(outcome.message);
+		},
+	},
+	{
+		name: "dirs",
+		description: "List this session's workspace directories",
+		acpDescription: "List this session's workspace directories",
+		handle: async (_command, runtime) => {
+			await runtime.output(formatWorkspaceDirectories(runtime.sessionManager));
+			return commandConsumed();
 		},
 	},
 	{
@@ -2516,6 +2698,7 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BU
 		description: command.description,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,
+		dirArgCompletions: command.dirArgCompletions,
 		getTuiAutocompleteDescription: command.getTuiAutocompleteDescription,
 	}),
 );
@@ -2528,7 +2711,7 @@ function materializeTuiBuiltinSlashCommand(
 	if (cmd.subcommands) {
 		materialized.getArgumentCompletions = buildArgumentCompletions(cmd.subcommands);
 		materialized.getInlineHint = buildSubcommandInlineHint(cmd.subcommands);
-	} else if (cmd.name === "move") {
+	} else if (cmd.dirArgCompletions) {
 		materialized.getArgumentCompletions = buildDirectoryArgumentCompletions();
 		if (cmd.inlineHint) materialized.getInlineHint = buildStaticInlineHint(cmd.inlineHint);
 	} else if (cmd.inlineHint) {

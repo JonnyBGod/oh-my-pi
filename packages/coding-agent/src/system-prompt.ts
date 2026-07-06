@@ -3,6 +3,7 @@
  */
 
 import * as os from "node:os";
+import * as path from "node:path";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample, TSchema } from "@oh-my-pi/pi-ai";
 import { renderToolInventory } from "@oh-my-pi/pi-ai/dialect";
@@ -467,6 +468,11 @@ export interface BuildSystemPromptOptions {
 	skillsSettings?: SkillsSettings;
 	/** Working directory. Default: getProjectDir() */
 	cwd?: string;
+	/**
+	 * Session workspace directories beyond cwd (ordered, absolute). Each gets
+	 * its own workspace tree and context-file discovery in the project prompt.
+	 */
+	additionalDirectories?: string[];
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -536,6 +542,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		skillsSettings,
 		toolNames: providedToolNames,
 		cwd,
+		additionalDirectories,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		rules,
@@ -561,6 +568,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
 	const resolvedCwd = cwd ?? getProjectDir();
+	const extraWorkspaceDirectories = Array.from(
+		new Set((additionalDirectories ?? []).map(directory => path.resolve(directory))),
+	).filter(directory => directory !== path.resolve(resolvedCwd));
 
 	const prepDefaults = {
 		resolvedCustomPrompt: undefined as string | undefined,
@@ -578,6 +588,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		activeRepoContext: null as ActiveRepoContext | null,
 		cpuModel: undefined as string | undefined,
 		gpu: undefined as string | undefined,
+		additionalWorkspaceTrees: [] as WorkspaceTree[],
+		additionalContextFiles: [] as Array<{ path: string; content: string; depth?: number }>,
 	};
 
 	const { promise: deadline, resolve: fireDeadline } = Promise.withResolvers<"__timeout__">();
@@ -637,6 +649,39 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 						totalLines: 0,
 						agentsMdFiles: [],
 					});
+	// Additional workspace roots get the same discovery treatment as cwd (per
+	// the ACP additional-directories contract): a workspace tree and context
+	// files per root. Both are always discovered here — `providedWorkspaceTree`
+	// and `providedContextFiles` only cover the primary cwd.
+	const additionalWorkspaceTreesPromise: Promise<WorkspaceTree[]> =
+		extraWorkspaceDirectories.length === 0
+			? Promise.resolve([])
+			: includeWorkspaceTree
+				? logger.time("buildAdditionalWorkspaceTrees", () =>
+						Promise.all(
+							extraWorkspaceDirectories.map(directory =>
+								buildWorkspaceTree(directory, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
+							),
+						),
+					)
+				: Promise.resolve(
+						extraWorkspaceDirectories.map(directory => ({
+							rootPath: directory,
+							rendered: "",
+							truncated: false,
+							totalLines: 0,
+							agentsMdFiles: [],
+						})),
+					);
+	const additionalContextFilesPromise: Promise<Array<{ path: string; content: string; depth?: number }>> =
+		extraWorkspaceDirectories.length === 0
+			? Promise.resolve([])
+			: logger.time("loadAdditionalContextFiles", async () => {
+					const perRoot = await Promise.all(
+						extraWorkspaceDirectories.map(directory => loadProjectContextFiles({ cwd: directory })),
+					);
+					return perRoot.flat();
+				});
 	const skillsPromise: Promise<readonly Skill[]> =
 		providedSkills !== undefined
 			? Promise.resolve(providedSkills)
@@ -654,12 +699,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
 		systemPromptCustomization,
-		contextFiles,
+		primaryContextFiles,
 		skills,
 		workspaceTree,
 		activeRepoContext,
 		cpuModel,
 		gpu,
+		additionalWorkspaceTrees,
+		additionalContextFiles,
 	] = await Promise.all([
 		withDeadline(
 			"customPrompt",
@@ -684,9 +731,27 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		withDeadline("resolveActiveRepoContext", activeRepoContextPromise, prepDefaults.activeRepoContext),
 		withDeadline("getCpuModel", cpuModelPromise, prepDefaults.cpuModel),
 		withDeadline("getCachedGpu", gpuPromise, prepDefaults.gpu),
+		withDeadline(
+			"buildAdditionalWorkspaceTrees",
+			additionalWorkspaceTreesPromise,
+			prepDefaults.additionalWorkspaceTrees,
+		),
+		withDeadline("loadAdditionalContextFiles", additionalContextFilesPromise, prepDefaults.additionalContextFiles),
 	]);
 	clearTimeout(deadlineTimer);
-	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
+	// Additional-root files come first so the primary cwd's context stays last
+	// (most prominent); byte-identical duplicates collapse to the cwd copy.
+	const contextFiles = dedupeExactContextFiles([...additionalContextFiles, ...primaryContextFiles]);
+	// Primary-tree entries are cwd-relative; entries from additional roots are
+	// absolutized so the dir-context list stays unambiguous across roots.
+	const agentsMdFiles = Array.from(
+		new Set([
+			...workspaceTree.agentsMdFiles,
+			...additionalWorkspaceTrees.flatMap(tree => tree.agentsMdFiles.map(file => path.join(tree.rootPath, file))),
+		]),
+	)
+		.sort()
+		.slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
@@ -789,6 +854,11 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
+		additionalWorkspaceRoots: additionalWorkspaceTrees.map(tree => ({
+			path: shortenPath(normalizePromptPath(tree.rootPath)),
+			rendered: tree.rendered,
+			truncated: tree.truncated,
+		})),
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,

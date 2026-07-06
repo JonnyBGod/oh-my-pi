@@ -17,11 +17,11 @@
  * share across concurrent edit tools.
  */
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { Filesystem, NotFoundError, type PreflightWriteOptions, type WriteResult } from "@oh-my-pi/hashline";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import type { FileDiagnosticsResult, WritethroughCallback, WritethroughDeferredHandle } from "../../lsp";
 import { FileChangeType, notifyWorkspaceWatchedFiles } from "../../lsp/client";
+import { workspaceRootForPath } from "../../session/session-workspace";
 import type { ToolSession } from "../../tools";
 import { routeWriteThroughBridge } from "../../tools/acp-bridge";
 import { assertEditableFileContent } from "../../tools/auto-generated-guard";
@@ -84,7 +84,10 @@ export class HashlineFilesystem extends Filesystem {
 	}
 
 	resolveAbsolute(relativePath: string): string {
-		return resolvePlanPath(this.session, relativePath);
+		// Hashline edits always target files the model has read; enable the
+		// cross-root fallback so a relative header path from another workspace
+		// directory resolves to the file it was read from.
+		return resolvePlanPath(this.session, relativePath, { workspaceFallback: true });
 	}
 
 	canonicalPath(relativePath: string): string {
@@ -98,13 +101,17 @@ export class HashlineFilesystem extends Filesystem {
 		// Recovery rebinds a bare/mis-typed authored path onto the file its
 		// snapshot tag uniquely names. Confine the redirect to locations a plain
 		// "write" may legitimately target:
-		//  1. the working tree (the model dropped the directory), or
+		//  1. any declared workspace root — the model dropped the directory, or
+		//     the file lives in an ADDITIONAL root that `resolveAbsolute` reaches
+		//     via `workspaceFallback`, or
 		//  2. the session `local://` sandbox where plan/scratch artifacts live —
 		//     the snapshot tag proves the model wrote/read that exact file this
 		//     session, so a bare `plan.md#tag` should land on `local://plan.md`.
-		// The secret vault and any other out-of-tree path stay refused.
-		const root = canonicalSnapshotKey(this.session.cwd);
-		if (resolvedPath === root || resolvedPath.startsWith(`${root}${path.sep}`)) return true;
+		// The secret vault and any other out-of-root path stay refused. Roots are
+		// canonicalized to match `resolvedPath`, which is a realpath'd snapshot key.
+		const directories = this.session.directories ?? [this.session.cwd];
+		const roots = directories.map(directory => canonicalSnapshotKey(directory));
+		if (workspaceRootForPath(resolvedPath, roots, "") !== "") return true;
 		return targetsLocalSandbox(this.session, resolvedPath);
 	}
 

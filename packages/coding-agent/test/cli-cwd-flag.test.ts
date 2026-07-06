@@ -32,6 +32,13 @@ describe("parseArgs — --cwd flag", () => {
 		expect(result.config).toEqual(["base.yml", "team.yml"]);
 		expect(result.messages).toEqual(["hello"]);
 	});
+
+	it("parses repeated --add-dir workspace directories", () => {
+		const result = parseArgs(["--add-dir", "/tmp/docs", "--add-dir=/tmp/lib", "hello"]);
+
+		expect(result.addDir).toEqual(["/tmp/docs", "/tmp/lib"]);
+		expect(result.messages).toEqual(["hello"]);
+	});
 	it("applies --cwd before session lookup callers read the project directory", async () => {
 		const launchDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cwd-launch-"));
 		const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cwd-target-"));

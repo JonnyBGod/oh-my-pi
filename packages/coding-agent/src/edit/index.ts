@@ -113,6 +113,7 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 				transformDiagnostics: dedup
 					? (path, result) => getDiagnosticsLedger(session).reduce(path, result)
 					: undefined,
+				directories: session.directories,
 			})
 		: writethroughNoop;
 }

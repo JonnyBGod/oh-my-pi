@@ -287,6 +287,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
+	/**
+	 * Parent workspace directories beyond its cwd, inherited by the subagent.
+	 * Never contains the parent cwd, so worktree-isolated runs don't regain
+	 * access framing on the parent's primary directory.
+	 */
+	additionalDirectories?: string[];
 	worktree?: string;
 	agent: AgentDefinition;
 	task: string;
@@ -2486,9 +2492,17 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							suppressBreadcrumb: true,
 						}),
 					)
-				: SessionManager.inMemory(effectiveCwd);
+				: SessionManager.inMemory(effectiveCwd, undefined, {
+						additionalDirectories: options.additionalDirectories,
+					});
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
+			}
+			if (sessionFile && options.additionalDirectories && options.additionalDirectories.length > 0) {
+				// Revived subagent sessions take the parent's CURRENT workspace over
+				// whatever the persisted header recorded — the parent may have gained
+				// or lost roots since the subagent was first spawned.
+				sessionManager.setAdditionalDirectories(options.additionalDirectories);
 			}
 			sessionOpenedAt = performance.now();
 
