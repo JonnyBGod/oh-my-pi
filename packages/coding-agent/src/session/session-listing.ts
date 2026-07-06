@@ -28,6 +28,8 @@ export interface SessionInfo {
 	id: string;
 	/** Working directory where the session was started. Empty string for old sessions. */
 	cwd: string;
+	/** Ordered workspace directories beyond cwd. Absent for single-root sessions. */
+	additionalDirectories?: string[];
 	title?: string;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
@@ -271,6 +273,52 @@ function extractStringProperty(source: string, name: string, startIndex = 0): st
 	return decodeJsonStringFragment(source.slice(valueStart));
 }
 
+/**
+ * Extract a JSON array of strings without parsing the whole line. Bails to
+ * `undefined` on anything but a flat `["a","b"]` shape — the callers treat
+ * that the same as an absent property.
+ */
+function extractStringArrayProperty(source: string, name: string, startIndex = 0): string[] | undefined {
+	const propertyIndex = source.indexOf(`"${name}"`, startIndex);
+	if (propertyIndex === -1) return undefined;
+
+	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
+	if (colonIndex === -1) return undefined;
+
+	let valueIndex = colonIndex + 1;
+	while (valueIndex < source.length && /\s/.test(source[valueIndex]!)) valueIndex++;
+	if (source[valueIndex] !== "[") return undefined;
+
+	let escaped = false;
+	let inString = false;
+	for (let i = valueIndex + 1; i < source.length; i++) {
+		const char = source[i]!;
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') {
+			inString = !inString;
+			continue;
+		}
+		if (!inString && char === "]") {
+			try {
+				const parsed = JSON.parse(source.slice(valueIndex, i + 1));
+				return Array.isArray(parsed) && parsed.every((entry): entry is string => typeof entry === "string")
+					? parsed
+					: undefined;
+			} catch {
+				return undefined;
+			}
+		}
+	}
+	return undefined;
+}
+
 function countMessageMarkers(content: string): number {
 	let count = 0;
 	let index = 0;
@@ -307,6 +355,7 @@ interface SessionListHeader {
 	type: "session";
 	id: string;
 	cwd?: string;
+	additionalDirectories?: string[];
 	title?: string;
 	parentSession?: string;
 	timestamp?: string;
@@ -322,10 +371,14 @@ function sessionListHeaderFromRecord(
 	titleOverride?: string | null,
 ): SessionListHeader | undefined {
 	if (record?.type !== "session" || typeof record.id !== "string") return undefined;
+	const additionalDirectories = Array.isArray(record.additionalDirectories)
+		? record.additionalDirectories.filter((entry): entry is string => typeof entry === "string")
+		: undefined;
 	return {
 		type: "session",
 		id: record.id,
 		cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+		additionalDirectories: additionalDirectories?.length ? additionalDirectories : undefined,
 		title:
 			titleOverride === null
 				? undefined
@@ -343,6 +396,7 @@ function parseSessionListHeaderLine(line: string, titleOverride?: string | null)
 		type: "session",
 		id,
 		cwd: extractStringProperty(line, "cwd"),
+		additionalDirectories: extractStringArrayProperty(line, "additionalDirectories"),
 		title: titleOverride === null ? undefined : (titleOverride ?? extractStringProperty(line, "title")),
 		parentSession: extractStringProperty(line, "parentSession"),
 		timestamp: extractStringProperty(line, "timestamp"),
@@ -461,6 +515,7 @@ async function scanSessionFile(
 			path: file,
 			id: header.id,
 			cwd: header.cwd ?? "",
+			additionalDirectories: header.additionalDirectories,
 			title: header.title ?? shortSummary,
 			parentSessionPath: header.parentSession,
 			created: new Date(header.timestamp ?? ""),

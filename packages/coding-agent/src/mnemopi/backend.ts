@@ -37,6 +37,7 @@ import {
 	MnemopiSessionState,
 	requireMnemopi,
 	requireMnemopiCore,
+	resolveMnemopiScopedBanks,
 	setMnemopiSessionState,
 } from "./state";
 
@@ -127,9 +128,23 @@ export const mnemopiBackend: MemoryBackend = {
 		}
 
 		try {
-			const config = await loadMnemopiConfigWithProviders(settings, agentDir, modelRegistry, sessionId);
+			const config = await loadMnemopiConfigWithProviders(
+				settings,
+				agentDir,
+				modelRegistry,
+				sessionId,
+				session.sessionManager.getDirectories(),
+			);
 			await Promise.all([loadMnemopi(), loadMnemopiCore()]);
-			await installMnemopiState(session, config);
+			const state = await installMnemopiState(session, config);
+			// A mid-session workspace-root change moves the recall scope (each root
+			// contributes its project bank), so rebuild the state on the same signal
+			// LSP/Hindsight use. `agentDir`/`modelRegistry` are stable per session;
+			// close over them so the rebuild — and every re-subscription it makes —
+			// resolves the config against the same agent home and provider options.
+			state.unsubscribeWorkspace = session.sessionManager.onWorkspaceDirectoriesChanged(() => {
+				scheduleMnemopiStateRebuild(session, agentDir, modelRegistry);
+			});
 		} catch (error) {
 			logger.warn("Mnemopi: backend startup failed; memory backend inert.", { error: String(error) });
 		}
@@ -183,6 +198,7 @@ export const mnemopiBackend: MemoryBackend = {
 					agentDir,
 					session.modelRegistry,
 					session.sessionId,
+					session.sessionManager.getDirectories(),
 				);
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
@@ -318,6 +334,102 @@ export const mnemopiBackend: MemoryBackend = {
 		return await state?.recallForCompaction(messages);
 	},
 };
+
+interface MnemopiRebuildTask {
+	pending: boolean;
+	agentDir: string;
+	modelRegistry: ModelRegistry;
+}
+
+const mnemopiRebuildTasks = new WeakMap<AgentSession, MnemopiRebuildTask>();
+
+/**
+ * Coalesce and serialize workspace-scope rebuilds for one session. Mirrors
+ * Hindsight's `schedulePrimaryStateRebuild`: running overlapping rebuilds
+ * concurrently would let each capture the old state and leak the fresh state an
+ * earlier continuation already installed. `agentDir`/`modelRegistry` are stable
+ * per session; the latest values win harmlessly if a rebuild is re-requested
+ * while one is in flight.
+ */
+function scheduleMnemopiStateRebuild(session: AgentSession, agentDir: string, modelRegistry: ModelRegistry): void {
+	const existing = mnemopiRebuildTasks.get(session);
+	if (existing) {
+		existing.pending = true;
+		existing.agentDir = agentDir;
+		existing.modelRegistry = modelRegistry;
+		return;
+	}
+	const task: MnemopiRebuildTask = { pending: true, agentDir, modelRegistry };
+	mnemopiRebuildTasks.set(session, task);
+	void Promise.resolve()
+		.then(async () => {
+			while (task.pending) {
+				task.pending = false;
+				try {
+					await rebuildMnemopiStateOnWorkspaceChange(session, task.agentDir, task.modelRegistry);
+				} catch (error) {
+					logger.warn("Mnemopi: workspace scope rebuild failed.", { error: String(error) });
+				}
+			}
+		})
+		.finally(() => {
+			if (mnemopiRebuildTasks.get(session) === task) mnemopiRebuildTasks.delete(session);
+		});
+}
+
+/**
+ * Recompute the mnemopi scope from the live workspace directories and, when it
+ * actually moved, swap in a fresh primary state.
+ *
+ * The OLD state is disposed with `{ consolidate: false }`: its `closeOwned()`
+ * runs synchronously and no detached background consolidation is scheduled, so
+ * a consolidate cannot race the NEW state's freshly opened handles on the
+ * shared/global bank (which both states target when only a project bank was
+ * added/removed). `lastRetainedTurn` carries forward so the swap does not
+ * re-retain turns the old state already stored in the — typically unchanged —
+ * cwd-anchored retain bank; `hasRecalledForFirstTurn` resets so the next turn
+ * refreshes the recall block over the new scope.
+ */
+async function rebuildMnemopiStateOnWorkspaceChange(
+	session: AgentSession,
+	agentDir: string,
+	modelRegistry: ModelRegistry,
+): Promise<void> {
+	const current = getMnemopiSessionState(session);
+	if (!current || current.aliasOf) return;
+	const sessionId = session.sessionId;
+	if (!sessionId) return;
+
+	const config = loadMnemopiConfig(session.settings, agentDir, session.sessionManager.getDirectories());
+	if (mnemopiScopeUnchanged(current, config)) return;
+
+	await Promise.all([loadMnemopi(), loadMnemopiCore()]);
+	config.providerOptions = await resolveMnemopiProviderOptions(config, session.settings, modelRegistry, sessionId);
+
+	const next = new MnemopiSessionState({
+		sessionId,
+		config,
+		session,
+		lastRetainedTurn: current.lastRetainedTurn,
+	});
+	next.unsubscribeWorkspace = session.sessionManager.onWorkspaceDirectoriesChanged(() => {
+		scheduleMnemopiStateRebuild(session, agentDir, modelRegistry);
+	});
+	// Re-read the current state after the awaits: a concurrent owner (clear,
+	// shutdown) could have swapped it. Swap ours in and dispose whatever was
+	// there, unless it is already `next` (defensive — same guard as Hindsight).
+	const previous = setMnemopiSessionState(session, next);
+	if (previous && previous !== next) await previous.dispose({ consolidate: false });
+	next.attachSessionListeners();
+}
+
+/** Scope equality: same write bank and same recall-bank set (order-independent). */
+function mnemopiScopeUnchanged(previous: MnemopiSessionState, config: MnemopiBackendConfig): boolean {
+	const next = resolveMnemopiScopedBanks(config);
+	if (previous.getScopedRetainTarget().bank !== next.retainBank) return false;
+	const previousRecall = new Set(previous.getScopedRecallTargets().map(target => target.bank));
+	return previousRecall.size === next.recallBanks.length && next.recallBanks.every(bank => previousRecall.has(bank));
+}
 
 interface MnemopiStatsTarget {
 	bank: string;
@@ -479,8 +591,9 @@ async function loadMnemopiConfigWithProviders(
 	agentDir: string,
 	modelRegistry: ModelRegistry,
 	sessionId: string,
+	directories?: readonly string[],
 ): Promise<MnemopiBackendConfig> {
-	const config = loadMnemopiConfig(settings, agentDir);
+	const config = loadMnemopiConfig(settings, agentDir, directories);
 	config.providerOptions = await resolveMnemopiProviderOptions(config, settings, modelRegistry, sessionId);
 	return config;
 }

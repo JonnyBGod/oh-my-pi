@@ -607,10 +607,13 @@ export function decodeUtf8Text(bytes: Uint8Array): string | null {
 	}
 }
 
-export function prependSuffixResolutionNotice(text: string, suffixResolution?: { from: string; to: string }): string {
+export function prependSuffixResolutionNotice(
+	text: string,
+	suffixResolution?: { from: string; to: string; via?: string },
+): string {
 	if (!suffixResolution) return text;
 
-	const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
+	const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via ${suffixResolution.via ?? "suffix match"}]`;
 	return text ? `${notice}\n${text}` : notice;
 }
 /**

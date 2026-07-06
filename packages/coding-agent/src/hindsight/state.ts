@@ -243,6 +243,12 @@ export class HindsightSessionState {
 	 * Only set on primary states; aliases inherit the parent's subscription.
 	 */
 	unsubscribeScope?: () => void;
+	/**
+	 * Releases the {@link SessionManager.onWorkspaceDirectoriesChanged}
+	 * subscription that rebuilds the primary state when workspace roots change
+	 * mid-session (`/add-dir`, `/remove-dir`). Only set on primary states.
+	 */
+	unsubscribeWorkspace?: () => void;
 	/** Alias states delegate persistence config to a primary parent state. */
 	aliasOf?: HindsightSessionState;
 	readonly retainQueue: HindsightRetainQueue;
@@ -528,6 +534,8 @@ export class HindsightSessionState {
 		this.unsubscribe = undefined;
 		this.unsubscribeScope?.();
 		this.unsubscribeScope = undefined;
+		this.unsubscribeWorkspace?.();
+		this.unsubscribeWorkspace = undefined;
 		this.retainQueue.dispose();
 	}
 

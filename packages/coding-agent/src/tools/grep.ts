@@ -27,6 +27,7 @@ import { InternalUrlRouter } from "../internal-urls/router";
 import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "../modes/theme/theme";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
+import { workspaceRootForPath } from "../session/session-workspace";
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead, truncateLine } from "../session/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
@@ -50,6 +51,7 @@ import { formatMatchLine } from "./match-line-format";
 import type { OutputMeta } from "./output-meta";
 import {
 	expandDelimitedPathEntries,
+	formatPathRelativeToCwd,
 	hasGlobPathChars,
 	isLineInRanges,
 	type LineRange,
@@ -84,7 +86,7 @@ const searchPathEntry = type("string").describe(
 const searchSchema = type({
 	pattern: type("string").describe("regex pattern"),
 	"path?": searchPathEntry.describe(
-		'file, directory, glob, internal URL, or "<file>:<lines>" selector to search; pass several as a semicolon-delimited list ("src; tests"). Omitted -> searches the workspace root (".")',
+		'file, directory, glob, internal URL, or "<file>:<lines>" selector to search; pass several as a semicolon-delimited list ("src; tests"). Omitted -> searches every workspace directory',
 	),
 	"case?": type("boolean").describe("case-sensitive search"),
 	"gitignore?": type("boolean").describe("respect gitignore"),
@@ -975,7 +977,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				throw new ToolError("Skip must be a non-negative number");
 			}
 			const scopedPaths = toPathList(rawPath);
-			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
+			// Path-less searches span the whole session workspace: every workspace
+			// directory is in scope, exactly like cwd. Explicit paths narrow.
+			const workspaceDirectories = this.session.directories ?? [];
+			const effectivePaths =
+				scopedPaths.length > 0 ? scopedPaths : workspaceDirectories.length > 1 ? workspaceDirectories : ["."];
 			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
 			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd);
 			const materializedExternalPaths = new Map<string, string>();
@@ -1340,6 +1346,46 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						list.length = perFileMatchCap;
 					}
 				}
+				// match.path entries are rebased relative to the merged searchPath (the
+				// common base of all targets), NOT the cwd — absolutize with the same
+				// helper the range/archive remaps use before attributing to a root.
+				const rootOfFile = (file: string): string =>
+					workspaceRootForPath(matchAbsolutePath(file, searchPath), workspaceDirectories, this.session.cwd);
+				// Multi-root fairness (mirrors glob's per-root quota). A path-less grep
+				// auto-scopes every workspace directory and grep scans them in target
+				// order, so fileOrder front-loads the first root (usually cwd). A greedy
+				// file window then fills entirely from that root, starving the others to
+				// "0 shown" in the breakdown even when they matched. Interleave the
+				// per-root file buckets round-robin — the pagination-safe generalization
+				// of glob's equal cap/numRoots quota — so each page hands every root a
+				// fair share of the DEFAULT_FILE_LIMIT window. Only engages for the auto
+				// workspace scope with matches spanning >1 root and more files than one
+				// page holds; explicit-path and single-root scopes keep encounter order
+				// byte-for-byte.
+				if (
+					scopedPaths.length === 0 &&
+					workspaceDirectories.length > 1 &&
+					isMultiScope &&
+					fileOrder.length > DEFAULT_FILE_LIMIT
+				) {
+					const buckets = new Map<string, string[]>();
+					for (const file of fileOrder) {
+						const root = rootOfFile(file);
+						const bucket = buckets.get(root);
+						if (bucket) bucket.push(file);
+						else buckets.set(root, [file]);
+					}
+					if (buckets.size > 1) {
+						const lists = [...buckets.values()];
+						const fair: string[] = [];
+						for (let cursor = 0; fair.length < fileOrder.length; cursor++) {
+							for (const list of lists) {
+								if (cursor < list.length) fair.push(list[cursor]);
+							}
+						}
+						fileOrder.splice(0, fileOrder.length, ...fair);
+					}
+				}
 				const totalFiles = fileOrder.length;
 				// When native grep stopped at its internal cap, files past the cap were
 				// never surfaced — the file total is only a lower bound.
@@ -1390,6 +1436,35 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const limitMessage = fileLimitReached
 					? `Showing files ${skipFiles + 1}-${nextSkip} of ${totalFilesLabel}. Use skip=${nextSkip} for the next page, or narrow paths/pattern.`
 					: "";
+				// Multi-root visibility: mtime/encounter ordering front-loads the hot
+				// root, so page 1 can look cwd-only while other roots matched further
+				// down. A per-root shown/matched header makes cross-root coverage
+				// visible without paginating.
+				let workspaceBreakdown = "";
+				if (workspaceDirectories.length > 1) {
+					const totalByRoot = new Map<string, number>();
+					for (const file of fileOrder) {
+						const root = rootOfFile(file);
+						totalByRoot.set(root, (totalByRoot.get(root) ?? 0) + 1);
+					}
+					if (totalByRoot.size > 1) {
+						const shownByRoot = new Map<string, number>();
+						for (const file of windowFiles) {
+							const root = rootOfFile(file);
+							shownByRoot.set(root, (shownByRoot.get(root) ?? 0) + 1);
+						}
+						workspaceBreakdown = `Workspace roots: ${[...totalByRoot.entries()]
+							.map(([root, total]) => {
+								const label = formatPathRelativeToCwd(root, this.session.cwd) || ".";
+								const shown = shownByRoot.get(root) ?? 0;
+								const totalLabel = `${total}${result.limitReached ? "+" : ""}`;
+								return shown === total && !result.limitReached
+									? `${label}: ${total} file${total === 1 ? "" : "s"}`
+									: `${label}: ${shown} shown of ${totalLabel} matched`;
+							})
+							.join("; ")}`;
+					}
+				}
 				const { record: recordFile, list: fileList } = createFileRecorder();
 				const fileMatchCounts = new Map<string, number>();
 				// Detect explicit file targets that exceed the native grep size cap.
@@ -1567,6 +1642,10 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 						outputLines.push(...rendered.model);
 						displayLines.push(...rendered.display);
 					}
+				}
+				if (workspaceBreakdown) {
+					outputLines.unshift(workspaceBreakdown, "");
+					displayLines.unshift(workspaceBreakdown, "");
 				}
 				if (limitMessage) {
 					outputLines.push("", limitMessage);

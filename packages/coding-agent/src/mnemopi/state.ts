@@ -242,6 +242,12 @@ export class MnemopiSessionState {
 	lastRecallSnippet?: string;
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
+	/**
+	 * Releases the workspace-directories-changed subscription that rebuilds this
+	 * primary state when roots change mid-session (`/add-dir`, `/remove-dir`).
+	 * Only set on primary states; aliases share the parent's banks and scope.
+	 */
+	unsubscribeWorkspace?: () => void;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -736,6 +742,8 @@ export class MnemopiSessionState {
 	async dispose(options: { consolidate?: boolean; timeoutMs?: number } = {}): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.unsubscribeWorkspace?.();
+		this.unsubscribeWorkspace = undefined;
 		if (this.aliasOf) return;
 		const closeOwned = (): void => {
 			for (const memory of this.scoped.owned) memory.close();
@@ -825,13 +833,31 @@ function resolveScopedBanks(config: MnemopiBackendConfig): {
 	return { scoping, globalBank, retainBank, recallBanks };
 }
 
+/**
+ * Resolve the write bank plus the ordered recall banks for a config. Exposed so
+ * the backend's workspace-change rebuild can compare a freshly loaded config's
+ * scope against a live state's banks and skip a no-op rebuild.
+ */
+export function resolveMnemopiScopedBanks(config: MnemopiBackendConfig): {
+	retainBank: string;
+	recallBanks: readonly string[];
+} {
+	const banks = resolveScopedBanks(config);
+	return { retainBank: banks.retainBank, recallBanks: banks.recallBanks };
+}
+
 export function getMnemopiScopedDbPaths(config: MnemopiBackendConfig): readonly string[] {
 	return getMnemopiScopedBanks(config).map(bank => resolveBankDbPath(config, bank));
 }
 
 export function getMnemopiScopedBanks(config: MnemopiBackendConfig): readonly string[] {
 	const banks = resolveScopedBanks(config);
-	return uniqueBanks([banks.retainBank, banks.globalBank, ...banks.recallBanks]);
+	// Owned banks only: exclude cross-root recall banks so destructive/reporting
+	// callers (clear, stats, diagnose) never touch another workspace root's
+	// memory. Empty `recallOnlyBanks` (single-root) leaves this unchanged.
+	const recallOnly = new Set(config.recallOnlyBanks ?? []);
+	const owned = banks.recallBanks.filter(bank => !recallOnly.has(bank));
+	return uniqueBanks([banks.retainBank, banks.globalBank, ...owned]);
 }
 
 function dedupeScopedTargets(targets: readonly MnemopiScopedMemory[]): readonly MnemopiScopedMemory[] {

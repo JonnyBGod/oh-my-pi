@@ -102,6 +102,65 @@ describe("computeMnemopiBankScope (#2412)", () => {
 	});
 });
 
+describe("computeMnemopiBankScope multi-root recall union", () => {
+	const primary = "/projects/repo-a";
+	const secondary = "/projects/repo-b";
+
+	it("per-project unions every root's bank into recall while retain stays on the primary root", () => {
+		const primaryBank = computeMnemopiBankScope(undefined, primary, "per-project").bank;
+		const secondaryBank = computeMnemopiBankScope(undefined, secondary, "per-project").bank;
+		const scope = computeMnemopiBankScope(undefined, primary, "per-project", [primary, secondary]);
+
+		// Writes anchor to the primary (cwd) root only.
+		expect(scope.retainBank).toBe(primaryBank);
+		expect(scope.bank).toBe(primaryBank);
+		// Recall spans both roots' banks.
+		expect(scope.recallBanks).toContain(primaryBank);
+		expect(scope.recallBanks).toContain(secondaryBank);
+		expect([...scope.recallBanks].sort()).toEqual([primaryBank, secondaryBank].sort());
+	});
+
+	it("per-project-tagged unions both roots' banks plus the shared global bank", () => {
+		const primaryBank = computeMnemopiBankScope(undefined, primary, "per-project-tagged").bank;
+		const secondaryBank = computeMnemopiBankScope(undefined, secondary, "per-project-tagged").bank;
+		const scope = computeMnemopiBankScope(undefined, primary, "per-project-tagged", [primary, secondary]);
+
+		expect(scope.retainBank).toBe(primaryBank);
+		expect(scope.recallBanks).toContain(primaryBank);
+		expect(scope.recallBanks).toContain(secondaryBank);
+		expect(scope.recallBanks).toContain(scope.globalBank);
+	});
+
+	it("dedupes repeated roots so the same bank is not recalled twice", () => {
+		const scope = computeMnemopiBankScope(undefined, primary, "per-project", [primary, primary]);
+		const bank = computeMnemopiBankScope(undefined, primary, "per-project").bank;
+		expect(scope.recallBanks).toEqual([bank]);
+	});
+
+	it("global mode ignores the workspace roots entirely", () => {
+		const single = computeMnemopiBankScope(undefined, primary, "global");
+		const multi = computeMnemopiBankScope(undefined, primary, "global", [primary, secondary]);
+		expect(multi).toEqual(single);
+	});
+
+	describe("single-root no-op (identical to pre-change output)", () => {
+		it("per-project explicit [cwd] equals the default (omitted) scope", () => {
+			const omitted = computeMnemopiBankScope(undefined, primary, "per-project");
+			const explicit = computeMnemopiBankScope(undefined, primary, "per-project", [primary]);
+			expect(explicit).toEqual(omitted);
+			// No extra banks: exactly the primary project bank, which is also the retain bank.
+			expect(explicit.recallBanks).toEqual([explicit.retainBank]);
+		});
+
+		it("per-project-tagged explicit [cwd] equals the default (omitted) scope", () => {
+			const omitted = computeMnemopiBankScope(undefined, primary, "per-project-tagged");
+			const explicit = computeMnemopiBankScope(undefined, primary, "per-project-tagged", [primary]);
+			expect(explicit).toEqual(omitted);
+			expect(explicit.recallBanks).toEqual([explicit.retainBank, explicit.globalBank]);
+		});
+	});
+});
+
 describe("extendRecallWithLegacyBanks (#2412)", () => {
 	it("adds a sibling bank only when all working_memory rows tag the active cwd", () => {
 		const activeCwd = path.join(rootDir.path(), "projects", "myrepo");

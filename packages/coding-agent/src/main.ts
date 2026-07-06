@@ -371,7 +371,10 @@ interface AcpSessionHandle {
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 }
 
-type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
+type AcpSessionFactory = (
+	cwd: string,
+	options?: { interactivePrompts?: boolean; additionalDirectories?: string[] },
+) => Promise<AcpSessionHandle>;
 
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
@@ -416,8 +419,9 @@ async function loadTrustedSessionExtensions(
  */
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async (cwd, factoryOptions) => {
+		const additionalDirectories = factoryOptions?.additionalDirectories;
 		const nextSettings = await args.settings.cloneForCwd(cwd);
-		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
+		const nextSessionManager = SessionManager.create(cwd, args.sessionDir, undefined, { additionalDirectories });
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
@@ -1086,6 +1090,7 @@ export async function buildSessionOptions(
 ): Promise<CreateAgentSessionOptions> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
+		additionalDirectories: parsed.addDir,
 		autoApprove: parsed.autoApprove ?? false,
 	};
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));

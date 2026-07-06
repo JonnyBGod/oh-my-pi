@@ -1,196 +1,249 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import {
-	additionalWorkspaceDirectories,
-	normalizeSessionWorkspace,
-} from "@oh-my-pi/pi-coding-agent/session/session-workspace";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { makeAssistantMessage } from "./helpers";
 
-describe("normalizeSessionWorkspace", () => {
-	it("places cwd first and dedupes additional directories", () => {
-		const cwd = "/home/user/proj";
-		const workspace = normalizeSessionWorkspace({ cwd, directories: ["/home/user/other", cwd, "/home/user/other"] });
-		expect(workspace.cwd).toBe(path.resolve(cwd));
-		expect(workspace.directories).toEqual([path.resolve(cwd), path.resolve("/home/user/other")]);
-	});
-
-	it("resolves relative additional directories against the normalized cwd", () => {
-		const workspace = normalizeSessionWorkspace({ cwd: "/home/user/proj", directories: ["../sibling"] });
-		expect(workspace.directories).toEqual([path.resolve("/home/user/proj"), path.resolve("/home/user/sibling")]);
-	});
-
-	it("expands ~ to home", () => {
-		const workspace = normalizeSessionWorkspace({ cwd: "/tmp", directories: ["~/docs"] });
-		expect(workspace.directories[1]).toBe(path.join(process.env.HOME ?? os.homedir(), "docs"));
-	});
-});
-
-describe("additionalWorkspaceDirectories", () => {
-	it("returns every directory except cwd", () => {
-		const workspace = normalizeSessionWorkspace({ cwd: "/a", directories: ["/b", "/c"] });
-		expect(additionalWorkspaceDirectories(workspace)).toEqual([path.resolve("/b"), path.resolve("/c")]);
-	});
-
-	it("is empty for a single-root workspace", () => {
-		const workspace = normalizeSessionWorkspace({ cwd: "/a" });
-		expect(additionalWorkspaceDirectories(workspace)).toEqual([]);
-	});
-});
+function getHeader(entries: unknown[]): SessionHeader | undefined {
+	return entries.find(
+		(e): e is SessionHeader => typeof e === "object" && e !== null && "type" in e && (e as any).type === "session",
+	) as SessionHeader | undefined;
+}
 
 describe("SessionManager workspace directories", () => {
-	it("starts with no additional directories", () => {
-		const session = SessionManager.inMemory();
-		expect(session.getAdditionalDirectories()).toEqual([]);
-		expect([session.getCwd(), ...session.getAdditionalDirectories()]).toEqual([session.getCwd()]);
+	let testAgentDir: string;
+	let cwdA: string;
+	let cwdB: string;
+	let docs: string;
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
+
+	beforeEach(async () => {
+		testAgentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-workspace-test-"));
+		setAgentDir(testAgentDir);
+		cwdA = path.join(testAgentDir, "cwd-a");
+		cwdB = path.join(testAgentDir, "cwd-b");
+		docs = path.join(testAgentDir, "docs");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(cwdB, { recursive: true });
+		fs.mkdirSync(docs, { recursive: true });
 	});
 
-	it("seeds from setAdditionalDirectories and excludes cwd", async () => {
-		const session = SessionManager.inMemory();
-		await session.setAdditionalDirectories(["/some/other", session.getCwd()]);
-		// cwd is filtered out of the additional set.
-		expect(session.getAdditionalDirectories()).toEqual(["/some/other"]);
-		expect([session.getCwd(), ...session.getAdditionalDirectories()]).toEqual([session.getCwd(), "/some/other"]);
+	afterEach(async () => {
+		if (originalAgentDir) {
+			setAgentDir(originalAgentDir);
+		} else {
+			setAgentDir(fallbackAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
+		await fsp.rm(testAgentDir, { recursive: true, force: true });
 	});
 
-	it("addWorkspaceDirectory rejects the cwd itself", async () => {
-		const session = SessionManager.inMemory();
-		await expect(session.addWorkspaceDirectory(session.getCwd())).rejects.toThrow(/primary workspace root/);
+	it("persists additional directories in the header and restores them on open", async () => {
+		const session = SessionManager.create(cwdA, undefined, undefined, { additionalDirectories: [docs] });
+		await session.ensureOnDisk();
+		const file = session.getSessionFile()!;
+		await session.close();
+
+		const entries = await loadEntriesFromFile(file);
+		expect(getHeader(entries)?.additionalDirectories).toEqual([docs]);
+
+		const reopened = await SessionManager.open(file);
+		expect(reopened.getCwd()).toBe(path.resolve(cwdA));
+		expect(reopened.getDirectories()).toEqual([path.resolve(cwdA), docs]);
+		await reopened.close();
 	});
 
-	it("addWorkspaceDirectory returns the resolved path and dedupes on repeat", async () => {
-		const session = SessionManager.inMemory();
-		const added = await session.addWorkspaceDirectory("/another/repo");
-		expect(added).toBe(path.resolve("/another/repo"));
-		expect(session.getAdditionalDirectories()).toEqual([path.resolve("/another/repo")]);
+	it("treats legacy headers without additionalDirectories as single-root", async () => {
+		const file = SessionManager.createEmptySessionFile(cwdA);
+		const entries = await loadEntriesFromFile(file);
+		expect(getHeader(entries)?.additionalDirectories).toBeUndefined();
 
-		// Second add of the same path is a no-op.
-		const second = await session.addWorkspaceDirectory("/another/repo");
-		expect(second).toBeNull();
-		expect(session.getAdditionalDirectories()).toEqual([path.resolve("/another/repo")]);
+		const reopened = await SessionManager.open(file);
+		expect(reopened.getDirectories()).toEqual([path.resolve(cwdA)]);
+		expect(reopened.getWorkspace()).toEqual({
+			cwd: path.resolve(cwdA),
+			directories: [path.resolve(cwdA)],
+		});
+		await reopened.close();
 	});
 
-	it("addWorkspaceDirectory expands ~ to home", async () => {
-		const session = SessionManager.inMemory();
-		const home = os.homedir();
-		const added = await session.addWorkspaceDirectory("~/projects");
-		expect(added).toBe(path.join(home, "projects"));
-		expect(session.getAdditionalDirectories()).toEqual([path.join(home, "projects")]);
+	it("keeps cwd out of the additional list and normalizes entries", () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([cwdA, `${docs}${path.sep}`]);
+		expect(session.getDirectories()).toEqual([path.resolve(cwdA), docs]);
 	});
 
-	it("removeWorkspaceDirectory removes a known root and returns null when absent", async () => {
-		const session = SessionManager.inMemory();
-		await session.addWorkspaceDirectory("/x");
-		const removed = await session.removeWorkspaceDirectory("/x");
-		expect(removed).toBe(path.resolve("/x"));
-		expect(session.getAdditionalDirectories()).toEqual([]);
-
-		const again = await session.removeWorkspaceDirectory("/x");
-		expect(again).toBeNull();
-	});
-
-	it("removeWorkspaceDirectory matches ~-expanded paths", async () => {
-		const session = SessionManager.inMemory();
-		const home = os.homedir();
-		await session.addWorkspaceDirectory("~/projects");
-		// Removing with the ~ form should match the expanded stored path.
-		const removed = await session.removeWorkspaceDirectory("~/projects");
-		expect(removed).toBe(path.join(home, "projects"));
-		expect(session.getAdditionalDirectories()).toEqual([]);
-	});
-
-	it("persists additionalDirectories in the session header across reopen", async () => {
-		using tempDir = TempDir.createSync("@pi-session-workspace-persist-");
-		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		await session.addWorkspaceDirectory(path.join(tempDir.path(), "sibling"));
-		// Materialize on disk so reopen reads the header (lazy gate needs assistant output).
+	it("fork carries the workspace into the new session header", async () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([docs]);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		session.appendMessage(makeAssistantMessage());
 		await session.flush();
 
+		const forked = await session.fork();
+		expect(forked).toBeDefined();
+		expect(session.getDirectories()).toEqual([path.resolve(cwdA), docs]);
+
+		const entries = await loadEntriesFromFile(forked!.newSessionFile);
+		expect(getHeader(entries)?.additionalDirectories).toEqual([docs]);
+	});
+
+	it("moveTo drops the new cwd from the additional directories", async () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([cwdB, docs]);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		await session.moveTo(cwdB);
+
+		expect(session.getCwd()).toBe(path.resolve(cwdB));
+		expect(session.getDirectories()).toEqual([path.resolve(cwdB), docs]);
+
+		const entries = await loadEntriesFromFile(session.getSessionFile()!);
+		const header = getHeader(entries);
+		expect(header?.cwd).toBe(path.resolve(cwdB));
+		expect(header?.additionalDirectories).toEqual([docs]);
+	});
+
+	it("surfaces additional directories through session listing", async () => {
+		const session = SessionManager.create(cwdA, undefined, undefined, { additionalDirectories: [docs] });
+		await session.ensureOnDisk();
+		await session.close();
+
+		const sessions = await SessionManager.list(cwdA);
+		const listed = sessions.find(entry => entry.id === session.getSessionId());
+		expect(listed?.additionalDirectories).toEqual([docs]);
+	});
+
+	it("fires the workspace-change signal with previous and next when a root is added", () => {
+		const session = SessionManager.create(cwdA);
+		const calls: Array<{ previous: string[]; next: string[] }> = [];
+		session.onWorkspaceDirectoriesChanged((previous, next) => calls.push({ previous, next }));
+
+		session.setAdditionalDirectories([docs]);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0].previous).toEqual([path.resolve(cwdA)]);
+		expect(calls[0].next).toEqual([path.resolve(cwdA), docs]);
+	});
+
+	it("fires with the removed root recoverable from (previous - next) on removal", () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([cwdB, docs]);
+		const calls: Array<{ previous: string[]; next: string[] }> = [];
+		session.onWorkspaceDirectoriesChanged((previous, next) => calls.push({ previous, next }));
+
+		session.setAdditionalDirectories([docs]);
+
+		expect(calls).toHaveLength(1);
+		const retained = new Set(calls[0].next);
+		const removed = calls[0].previous.filter(dir => !retained.has(dir));
+		expect(removed).toEqual([path.resolve(cwdB)]);
+	});
+
+	it("does not fire when the directory set is unchanged (idempotent adopt)", () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([docs]);
+		let fired = 0;
+		session.onWorkspaceDirectoriesChanged(() => fired++);
+
+		// Same set, different array identity + order — must be treated as no-op.
+		session.setAdditionalDirectories([docs]);
+		session.setAdditionalDirectories([`${docs}${path.sep}`]);
+
+		expect(fired).toBe(0);
+	});
+
+	it("stops delivering after unsubscribe", () => {
+		const session = SessionManager.create(cwdA);
+		let fired = 0;
+		const unsubscribe = session.onWorkspaceDirectoriesChanged(() => fired++);
+
+		session.setAdditionalDirectories([docs]);
+		expect(fired).toBe(1);
+
+		unsubscribe();
+		session.setAdditionalDirectories([docs, cwdB]);
+		expect(fired).toBe(1);
+	});
+
+	it("persistWorkspaceChange durably flushes a mid-session add without a graceful close", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const file = session.getSessionFile()!;
+
+		// Mid-session add followed by the eager persist — no close()/flush() afterwards,
+		// mirroring the crash window between /add-dir and the next turn.
+		session.setAdditionalDirectories([docs]);
+		await session.persistWorkspaceChange();
+
+		// Read straight from disk: the added root must already be durable.
+		const entries = await loadEntriesFromFile(file);
+		expect(getHeader(entries)?.additionalDirectories).toEqual([docs]);
+
+		// A fresh manager opened on the same file (no graceful close of the first) sees it too.
+		const reopened = await SessionManager.open(file);
+		expect(reopened.getDirectories()).toEqual([path.resolve(cwdA), docs]);
+		await reopened.close();
+	});
+
+	it("persistWorkspaceChange durably flushes a mid-session removal", async () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([cwdB, docs]);
+		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const file = session.getSessionFile()!;
+
+		session.setAdditionalDirectories([docs]);
+		await session.persistWorkspaceChange();
+
+		const entries = await loadEntriesFromFile(file);
+		expect(getHeader(entries)?.additionalDirectories).toEqual([docs]);
+	});
+
+	it("persistWorkspaceChange no-ops for a file-backed session with no assistant message yet", async () => {
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([docs]);
+		await session.persistWorkspaceChange();
+
+		// The lazy gate is uncrossed (no assistant output, no ensureOnDisk), so no file
+		// should have been created — this is the session-adopt-time case the guard protects.
 		const file = session.getSessionFile();
-		expect(file).toBeDefined();
-		const reopened = await SessionManager.open(file!);
-		expect(reopened.getAdditionalDirectories()).toEqual([path.join(tempDir.path(), "sibling")]);
-		expect([reopened.getCwd(), ...reopened.getAdditionalDirectories()]).toEqual([
-			tempDir.path(),
-			path.join(tempDir.path(), "sibling"),
-		]);
+		expect(file === undefined || !fs.existsSync(file)).toBe(true);
 	});
 
-	it("clears the header field when the last additional directory is removed", async () => {
-		using tempDir = TempDir.createSync("@pi-session-workspace-clear-");
-		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		await session.addWorkspaceDirectory(path.join(tempDir.path(), "extra"));
-		session.appendMessage(makeAssistantMessage());
-		await session.flush();
+	it("persistWorkspaceChange is a safe no-op on an in-memory (no-file) session", async () => {
+		const session = SessionManager.inMemory(cwdA);
+		session.setAdditionalDirectories([docs]);
+		await session.persistWorkspaceChange();
 
-		await session.removeWorkspaceDirectory(path.join(tempDir.path(), "extra"));
+		expect(session.getSessionFile()).toBeUndefined();
+		expect(session.getDirectories()).toEqual([path.resolve(cwdA), docs]);
+	});
+
+	it("loads a session whose additional directory is missing without blocking", async () => {
+		const ghost = path.join(testAgentDir, "ghost");
+		fs.mkdirSync(ghost, { recursive: true });
+		const session = SessionManager.create(cwdA);
+		session.setAdditionalDirectories([ghost]);
+		await session.ensureOnDisk();
 		const file = session.getSessionFile()!;
-		const header = JSON.parse(
-			fs
-				.readFileSync(file, "utf8")
-				.split("\n")
-				.filter(l => l.trim())[1]!,
-		);
-		expect(header.additionalDirectories).toBeUndefined();
-	});
+		await session.close();
+		await fsp.rm(ghost, { recursive: true, force: true });
 
-	it("setAdditionalDirectories clears stale roots when called with an empty list", async () => {
-		const session = SessionManager.inMemory();
-		await session.addWorkspaceDirectory("/stale");
-		expect(session.getAdditionalDirectories()).toEqual([path.resolve("/stale")]);
-
-		await session.setAdditionalDirectories([]);
-		expect(session.getAdditionalDirectories()).toEqual([]);
-	});
-
-	it("setAdditionalDirectories persists the updated header on a resumed session", async () => {
-		using tempDir = TempDir.createSync("@pi-session-workspace-resume-");
-		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		// Simulate a resumed session: append an assistant message so the file exists, then setAdditionalDirectories.
-		session.appendMessage(makeAssistantMessage());
-		await session.flush();
-
-		await session.setAdditionalDirectories([path.join(tempDir.path(), "added")]);
-		const file = session.getSessionFile()!;
-		const header = JSON.parse(
-			fs
-				.readFileSync(file, "utf8")
-				.split("\n")
-				.filter(l => l.trim())[1]!,
-		);
-		expect(header.additionalDirectories).toEqual([path.join(tempDir.path(), "added")]);
-	});
-
-	it("keeps seeded roots in memory until the session is durable (no empty session file)", async () => {
-		using tempDir = TempDir.createSync("@pi-session-workspace-lazy-");
-		const session = SessionManager.create(tempDir.path(), tempDir.path());
-		await session.setAdditionalDirectories([path.join(tempDir.path(), "extra")]);
-		await session.addWorkspaceDirectory(path.join(tempDir.path(), "extra2"));
-		// Seeding roots must not materialize an empty resumable session file.
-		expect(fs.readdirSync(tempDir.path()).filter(f => f.endsWith(".jsonl"))).toEqual([]);
-
-		// Once the session produces durable output, the header carries the roots.
-		session.appendMessage(makeAssistantMessage());
-		await session.flush();
-		const reopened = await SessionManager.open(session.getSessionFile()!);
-		expect(reopened.getAdditionalDirectories()).toEqual([
-			path.join(tempDir.path(), "extra"),
-			path.join(tempDir.path(), "extra2"),
-		]);
-	});
-
-	it("forkFrom preserves additionalDirectories from the source session", async () => {
-		using tempDir = TempDir.createSync("@pi-session-workspace-fork-");
-		const source = SessionManager.create(tempDir.path(), tempDir.path());
-		await source.addWorkspaceDirectory(path.join(tempDir.path(), "extra"));
-		source.appendMessage(makeAssistantMessage());
-		await source.flush();
-
-		const forked = await SessionManager.forkFrom(source.getSessionFile()!, tempDir.path());
-		expect(forked.getAdditionalDirectories()).toEqual([path.join(tempDir.path(), "extra")]);
+		const reopened = await SessionManager.open(file);
+		expect(reopened.getCwd()).toBe(path.resolve(cwdA));
+		expect(reopened.getDirectories()).toEqual([path.resolve(cwdA), ghost]);
+		await reopened.close();
 	});
 });

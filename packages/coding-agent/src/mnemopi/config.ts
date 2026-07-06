@@ -21,6 +21,14 @@ export interface MnemopiBackendConfig {
 	globalBank?: string;
 	retainBank?: string;
 	recallBanks?: readonly string[];
+	/**
+	 * Banks that belong to OTHER workspace roots in a multi-root session:
+	 * recall-visible only. They are a subset of `recallBanks` and are excluded
+	 * from every owning/destructive operation (`getMnemopiScopedBanks`, and thus
+	 * `/memory clear`, stats, diagnose) so a cwd-anchored session never writes to
+	 * or deletes another repo's memory bank. Empty/undefined for single-root.
+	 */
+	recallOnlyBanks?: readonly string[];
 	scoping?: MnemopiScoping;
 	autoRecall: boolean;
 	autoRetain: boolean;
@@ -40,16 +48,33 @@ export interface MnemopiBackendConfig {
 	llmModel?: string;
 }
 
-export function loadMnemopiConfig(settings: Settings, agentDir: string): MnemopiBackendConfig {
+export function loadMnemopiConfig(
+	settings: Settings,
+	agentDir: string,
+	directories?: readonly string[],
+): MnemopiBackendConfig {
 	const configuredDbPath = settings.get("mnemopi.dbPath");
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemopi.scoping");
 	const dbPath = configuredDbPath?.trim()
 		? configuredDbPath
 		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
-	const scope = computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping);
+	// `directories` is the cwd-first workspace root list. Omitting it (or passing
+	// an empty list) yields a single-root scope anchored on `cwd`, so callers
+	// without session access — and every single-root session — behave exactly as
+	// before. Destructive/clear paths deliberately omit it so cross-root recall
+	// banks are never deleted (see mnemopiBackend.clear).
+	const roots = directories && directories.length > 0 ? directories : [cwd];
+	const scope = computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping, roots);
 	const recallBanks =
 		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
+	// Cross-root recall banks = the union scope minus the primary (cwd-only)
+	// scope. These are read-only recall targets; `getMnemopiScopedBanks` strips
+	// them so clear/stats/diagnose stay anchored to the cwd root. Legacy banks
+	// (added above) are cwd-safe and intentionally NOT recall-only, so clear
+	// still reaps them. Empty for single-root sessions.
+	const primaryRecallBanks = new Set(computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping).recallBanks);
+	const recallOnlyBanks = scope.recallBanks.filter(bank => !primaryRecallBanks.has(bank));
 	const llmMode = settings.get("mnemopi.llmMode");
 	const embeddingOverride = settings.get("mnemopi.embeddingModel");
 	const embeddingVariant = settings.get("mnemopi.embeddingVariant");
@@ -69,6 +94,7 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		globalBank: scope.globalBank,
 		retainBank: scope.retainBank,
 		recallBanks,
+		recallOnlyBanks,
 		scoping,
 		autoRecall: settings.get("mnemopi.autoRecall"),
 		autoRetain: settings.get("mnemopi.autoRetain"),
@@ -124,14 +150,25 @@ export interface MnemopiBankScope {
  * project-local write bank plus a shared recall-visible bank. The project
  * bank is derived purely from {@link cwd} — see {@link projectBank} for the
  * stability contract.
+ *
+ * In a multi-root session, `directories` carries every workspace root (cwd
+ * first). Recall unions each root's project bank so the agent surfaces
+ * memories from every repo the session spans; writes stay anchored to the
+ * primary (cwd) root via `retainBank`/`bank`. `directories` defaults to
+ * `[cwd]`, so single-root sessions collapse to the pre-multi-root behavior.
  */
 export function computeMnemopiBankScope(
 	configured: string | undefined,
 	cwd: string,
 	scoping: MnemopiScoping,
+	directories: readonly string[] = [cwd],
 ): MnemopiBankScope {
 	const project = projectBank(configured, cwd);
 	const globalBank = sharedBank(configured);
+	// Union of every root's project bank, cwd first. Reuses `projectBank` so
+	// each root hashes identically to how it would in its own single-root
+	// session. For a single root this is just `[project]`.
+	const projectBanks = dedupeStrings(directories.map(directory => projectBank(configured, directory)));
 	switch (scoping) {
 		case "global":
 			return {
@@ -147,7 +184,7 @@ export function computeMnemopiBankScope(
 				bank: project,
 				globalBank,
 				retainBank: project,
-				recallBanks: [project],
+				recallBanks: projectBanks,
 			};
 		case "per-project-tagged":
 			return {
@@ -155,9 +192,13 @@ export function computeMnemopiBankScope(
 				bank: project,
 				globalBank,
 				retainBank: project,
-				recallBanks: project === globalBank ? [project] : [project, globalBank],
+				recallBanks: dedupeStrings([...projectBanks, globalBank]),
 			};
 	}
+}
+
+function dedupeStrings(values: readonly string[]): string[] {
+	return [...new Set(values)];
 }
 
 function sharedBank(configured: string | undefined): string {

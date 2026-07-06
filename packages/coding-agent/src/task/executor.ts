@@ -388,7 +388,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /** Options for subagent execution */
 export interface ExecutorOptions {
 	cwd: string;
-	/** Additional workspace directories to seed on the subagent session (multi-root). */
+	/**
+	 * Parent workspace directories beyond its cwd, inherited by the subagent.
+	 * Never contains the parent cwd, so worktree-isolated runs don't regain
+	 * access framing on the parent's primary directory.
+	 */
 	additionalDirectories?: string[];
 	/** Exact provider credential resolver inherited from the parent session. */
 	getApiKey?: CreateAgentSessionOptions["getApiKey"];
@@ -3237,7 +3241,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						initialCwd: effectiveCwd,
 						suppressBreadcrumb: true,
 					})
-				: Promise.resolve(SessionManager.inMemory(effectiveCwd));
+				: Promise.resolve(
+						SessionManager.inMemory(effectiveCwd, undefined, {
+							additionalDirectories: options.additionalDirectories,
+						}),
+					);
 			// Setup below can fail before this promise's consumption boundary.
 			// Observe rejection immediately while preserving it for the later await.
 			sessionManagerPromise.catch(() => {});
@@ -3414,6 +3422,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			const sessionManager = await awaitAbortable(sessionManagerPromise);
 			if (options.parentArtifactManager) {
 				sessionManager.adoptArtifactManager(options.parentArtifactManager);
+			}
+			if (sessionFile && options.additionalDirectories && options.additionalDirectories.length > 0) {
+				// Revived subagent sessions take the parent's CURRENT workspace over
+				// whatever the persisted header recorded — the parent may have gained
+				// or lost roots since the subagent was first spawned.
+				sessionManager.setAdditionalDirectories(options.additionalDirectories);
 			}
 			sessionOpenedAt = performance.now();
 			if (ircEnabled) {

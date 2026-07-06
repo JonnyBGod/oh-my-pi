@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Normalized the session workspace model across the lifecycle: additional directories are re-normalized against `cwd` at every adoption point (create, load, fork, `moveTo`) so the workspace list never contains `cwd`, duplicates, or unresolved paths; forked sessions inherit the parent workspace, and subagents inherit the parent session's additional roots.
+- Added ACP multi-root support: `sessionCapabilities.additionalDirectories` is advertised in `initialize`, `additionalDirectories` is accepted on `session/new`, `session/load`, `session/resume`, and `unstable_session/fork` (complete-list override semantics), and `session/list` reports `SessionInfo.additionalDirectories`.
+- Added multi-root awareness to the tools: path-less `grep` and relative `glob` automatically span every workspace directory (with per-root result fairness and a per-root shown/matched breakdown) while explicit paths narrow the scope; `read` falls back across roots when a relative path misses under `cwd` (unique match resolves with a notice, ambiguous match errors with the candidates); `edit` resolves relative paths for existing files through their unique containing root (ambiguity errors; create and rename targets stay `cwd`-anchored); the system prompt renders each additional root's directory tree and inlined context files (AGENTS.md etc.); and LSP picks each written file's server root by longest-prefix match instead of collapsing everything onto the session `cwd`, shutting down a removed root's clients.
+- Added multi-root recall-union to the memory backends: in a multi-root session, memory recall spans every workspace root's scope (mnemopi unions each root's bank; Hindsight `per-project-tagged` unions each root's `project:` tag with `match: "any"`), while writes stay attributed to the primary root (`cwd`) and destructive/reporting operations (`/memory clear`, stats, diagnose) only ever touch the primary root's own banks — never another repo's memory. Single-root sessions are unchanged, and memory remains `off` by default. Hindsight `per-project` mode (a distinct bank per repo, keyed into the request URL) unions recall in a follow-up.
+
 ### Fixed
 
 - Report oversized selected lines that cannot fit after read context, with a working raw recovery selector instead of a looping continuation hint ([#10775](https://github.com/can1357/oh-my-pi/issues/10775)).

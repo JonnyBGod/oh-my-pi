@@ -156,6 +156,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import type { IrcMessage } from "../irc/bus";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { shutdownClientsForRoot } from "../lsp/client";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, renderOrchestrateNotice } from "../modes/orchestrate";
@@ -578,6 +579,7 @@ export class AgentSession {
 	#unsubscribeModelRoles?: () => void;
 	#unsubscribeExtendedContext?: () => void;
 	#unsubscribeCodeMode?: () => void;
+	#unsubscribeWorkspaceLsp?: () => void;
 	#unsubscribeEvalPreludeSettings?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
@@ -1851,6 +1853,18 @@ export class AgentSession {
 		// its refreshed same-selector entry (#10488) once discovery settles.
 		void this.#retryInactiveAdvisorAfterModelDiscovery();
 		void this.#revalidateFallbackChainsAfterModelDiscovery();
+		// Tear down LSP clients for roots dropped from the workspace mid-session
+		// (`/remove-dir`). Adds are left to lazy spawn on first use. LSP clients
+		// are module-global and keyed by root, so this only needs the removed set.
+		this.#unsubscribeWorkspaceLsp = this.sessionManager.onWorkspaceDirectoriesChanged((previous, next) => {
+			const retained = new Set(next);
+			for (const root of previous) {
+				if (retained.has(root)) continue;
+				void shutdownClientsForRoot(root).catch(err => {
+					logger.debug("LSP: workspace-root client shutdown failed", { root, error: String(err) });
+				});
+			}
+		});
 		if (config.rebindModelAfterDiscovery) void this.#rebindActiveModelAfterModelDiscovery();
 	}
 	/** Model registry for API key resolution and model discovery */
@@ -4575,6 +4589,10 @@ export class AgentSession {
 		if (this.#unsubscribeEvalPreludeSettings) {
 			this.#unsubscribeEvalPreludeSettings();
 			this.#unsubscribeEvalPreludeSettings = undefined;
+		}
+		if (this.#unsubscribeWorkspaceLsp) {
+			this.#unsubscribeWorkspaceLsp();
+			this.#unsubscribeWorkspaceLsp = undefined;
 		}
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();

@@ -1527,6 +1527,31 @@ export async function shutdownClient(key: string): Promise<boolean> {
 	return await shutdownClientInstance(client);
 }
 
+/**
+ * Shut down every LSP client rooted at `root`. Matches on `resolve`-equal
+ * `client.cwd`, the same root filter {@link notifyWorkspaceWatchedFiles} uses.
+ * Called when a workspace root is dropped mid-session (`/remove-dir`) so the
+ * removed root's language servers don't linger — idle-timeout teardown is off
+ * by default, so nothing else reaps them.
+ *
+ * Deletes each match from the `clients` map BEFORE the async shutdown/exit
+ * handshake — mirroring {@link shutdownAll} — so a concurrent
+ * {@link getOrCreateClient} for the same key never hands back a client that is
+ * already mid-shutdown; it spawns a fresh one instead.
+ */
+export async function shutdownClientsForRoot(root: string): Promise<void> {
+	const workspace = path.resolve(root);
+	const matched: LspClient[] = [];
+	for (const [key, client] of Array.from(clients.entries())) {
+		if (path.resolve(client.cwd) === workspace) {
+			clients.delete(key);
+			matched.push(client);
+		}
+	}
+	if (matched.length === 0) return;
+	await Promise.allSettled(matched.map(client => shutdownClientInstance(client)));
+}
+
 // =============================================================================
 // LSP Protocol Methods
 // =============================================================================

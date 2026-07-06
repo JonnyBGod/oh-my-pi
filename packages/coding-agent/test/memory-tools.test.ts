@@ -18,6 +18,7 @@ import { HindsightSessionState } from "@oh-my-pi/pi-coding-agent/hindsight/state
 import { mnemopiBackend } from "@oh-my-pi/pi-coding-agent/mnemopi/backend";
 import { loadMnemopiConfig, type MnemopiBackendConfig } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import {
+	getMnemopiScopedBanks,
 	getMnemopiScopedDbPaths,
 	getMnemopiSessionState,
 	loadMnemopi,
@@ -1179,6 +1180,34 @@ describe("Mnemopi backend lifecycle", () => {
 		registeredMnemopiState = getMnemopiSessionState(session);
 		expect(registeredMnemopiState).toBeDefined();
 		expect(listeners.size).toBe(1);
+	});
+
+	it("owning/destructive scope excludes another workspace root's recall-only bank", () => {
+		// Multi-root per-project session: cwd=repo-a (primary) + repo-b additional
+		// root. recallBanks unions both so recall spans them, but repo-b is flagged
+		// recall-only. Owning/destructive callers (clear, stats, diagnose) route
+		// through getMnemopiScopedBanks/DbPaths and must never see repo-b, so
+		// `/memory clear` can never delete another repo's memory bank.
+		const config = makeMnemopiConfig({
+			scoping: "per-project",
+			bank: "repo-a",
+			globalBank: "default",
+			retainBank: "repo-a",
+			recallBanks: ["repo-a", "repo-b"],
+			recallOnlyBanks: ["repo-b"],
+		});
+
+		const scopedBanks = getMnemopiScopedBanks(config);
+		expect(scopedBanks).toContain("repo-a");
+		expect(scopedBanks).not.toContain("repo-b");
+
+		// The deletion set (paths clear() removes) must not include repo-b's DB.
+		const ownedPaths = getMnemopiScopedDbPaths(config);
+		const crossRootPath = getMnemopiScopedDbPaths({ ...config, recallOnlyBanks: [] }).find(
+			p => !ownedPaths.includes(p),
+		);
+		expect(crossRootPath).toBeDefined();
+		expect(ownedPaths).not.toContain(crossRootPath);
 	});
 
 	it("clear() skips consolidation before deleting the DBs (#2327 review)", async () => {

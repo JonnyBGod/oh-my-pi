@@ -25,6 +25,8 @@ export interface BuiltinSlashCommand {
 	subcommands?: SubcommandDef[];
 	/** Static inline hint when command takes a simple argument (no subcommands). */
 	inlineHint?: string;
+	/** Enable inline directory-path Tab-completion for this command's argument. */
+	dirArgCompletions?: boolean;
 	/** TUI-only dynamic status text for command-name autocomplete. Static `description` remains canonical for ACP/help. */
 	getTuiAutocompleteDescription?: (runtime: TuiSlashCommandRuntime) => string | undefined;
 }

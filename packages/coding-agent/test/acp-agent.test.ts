@@ -156,9 +156,10 @@ class FakeAgentSession {
 
 	constructor(
 		cwd: string,
+		additionalDirectories?: string[],
 		private readonly models: Model[] = TEST_MODELS,
 	) {
-		this.sessionManager = SessionManager.create(cwd);
+		this.sessionManager = SessionManager.create(cwd, undefined, undefined, { additionalDirectories });
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
 			sessionId: this.sessionId,
@@ -520,8 +521,13 @@ async function createHarness(
 
 	const initialSession = new FakeAgentSession(cwdA);
 	sessions.push(initialSession);
-	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
-		const session = new FakeAgentSession(cwd);
+	const factory = async (
+		cwd: string,
+		factoryOptions?: { interactivePrompts?: boolean; additionalDirectories?: string[] },
+	) => {
+		// Mirrors createAcpSessionFactory: ACP-provided directories are part of
+		// SessionManager construction, so the first persisted header carries them.
+		const session = new FakeAgentSession(cwd, factoryOptions?.additionalDirectories);
 		const setToolUIContext = vi.fn();
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
@@ -3336,4 +3342,138 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 			refreshSpy.mockRestore();
 		}
 	}, 15_000);
+});
+
+describe("ACP workspace directories", () => {
+	async function makeWorkspaceDirs(harness: AgentHarness, ...names: string[]): Promise<string[]> {
+		const root = path.dirname(harness.cwdA);
+		const dirs: string[] = [];
+		for (const name of names) {
+			const dir = path.join(root, name);
+			await fs.promises.mkdir(dir, { recursive: true });
+			dirs.push(dir);
+		}
+		return dirs;
+	}
+
+	it("maps session/new additionalDirectories into the session workspace in order", async () => {
+		const harness = await createHarness();
+		const [docs, lib] = await makeWorkspaceDirs(harness, "docs", "lib");
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [docs!, lib!],
+		});
+		const session = harness.findSession(created.sessionId);
+		expect(session?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA), docs!, lib!]);
+		expect(session?.sessionManager.getHeader()?.additionalDirectories).toEqual([docs!, lib!]);
+
+		// session/list reports the workspace via SessionInfo.additionalDirectories.
+		const listed = await harness.agent.listSessions({ cwd: harness.cwdA });
+		const info = listed.sessions.find(entry => entry.sessionId === created.sessionId);
+		expect(info?.additionalDirectories).toEqual([docs!, lib!]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("defaults to a single-root workspace when no additionalDirectories are sent", async () => {
+		const harness = await createHarness();
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		expect(session?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA)]);
+		expect(session?.sessionManager.getHeader()?.additionalDirectories).toBeUndefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rejects relative additional directories", async () => {
+		const harness = await createHarness();
+
+		await expect(
+			harness.agent.newSession({
+				cwd: harness.cwdA,
+				mcpServers: [],
+				additionalDirectories: ["relative/docs"],
+			}),
+		).rejects.toThrow("ACP additional directory must be absolute");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("restores persisted workspace directories on session/load and applies overrides", async () => {
+		const harness = await createHarness();
+		const [docs, lib, other] = await makeWorkspaceDirs(harness, "docs", "lib", "other");
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [docs!, lib!],
+		});
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+
+		// Load without a list: the serialized workspace comes back from the header.
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const loaded = harness.sessions.at(-1);
+		expect(loaded?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA), docs!, lib!]);
+
+		// Resume with an explicit list: sets the complete additional-directory list.
+		await harness.agent.resumeSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [other!],
+		});
+		expect(loaded?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA), other!]);
+
+		// Resume with an empty list clears the additional directories entirely.
+		await harness.agent.resumeSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [],
+		});
+		expect(loaded?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA)]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("fork inherits the source workspace and honors an explicit override", async () => {
+		const harness = await createHarness();
+		const [docs, other] = await makeWorkspaceDirs(harness, "docs", "other");
+
+		const created = await harness.agent.newSession({
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [docs!],
+		});
+		const source = harness.findSession(created.sessionId);
+		source?.sessionManager.appendMessage({ role: "user", content: "fork me", timestamp: Date.now() });
+		await source?.sessionManager.flush();
+
+		const inherited = await harness.agent.unstable_forkSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+		const inheritedSession = harness.findSession(inherited.sessionId);
+		expect(inheritedSession?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA), docs!]);
+
+		const overridden = await harness.agent.unstable_forkSession({
+			sessionId: created.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			additionalDirectories: [other!],
+		});
+		const overriddenSession = harness.findSession(overridden.sessionId);
+		expect(overriddenSession?.sessionManager.getDirectories()).toEqual([path.resolve(harness.cwdA), other!]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
 });

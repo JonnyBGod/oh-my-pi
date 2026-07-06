@@ -41,8 +41,9 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	/**
-	 * Additional workspace directories beyond `cwd` (multi-root workspace).
-	 * Absolute, normalized, deduplicated. Absent on legacy single-cwd sessions.
+	 * Ordered workspace directories beyond `cwd` (absolute, normalized,
+	 * deduplicated). Absent on legacy single-cwd sessions; the effective
+	 * workspace is always `[cwd, ...additionalDirectories]`.
 	 * See {@link SessionWorkspace} in `./session-workspace`.
 	 */
 	additionalDirectories?: string[];

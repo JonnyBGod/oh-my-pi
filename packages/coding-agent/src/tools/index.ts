@@ -154,6 +154,11 @@ export interface DeferredDiagnosticsEntry {
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
+	/**
+	 * Ordered workspace directories (`cwd` first). Multi-root tools (grep, glob,
+	 * read) scope across these; a missing value means cwd-only.
+	 */
+	directories?: string[];
 	/** Additional workspace directories beyond cwd (multi-root), forwarded to subagents. */
 	additionalDirectories?: string[];
 	/** Whether UI is available */
