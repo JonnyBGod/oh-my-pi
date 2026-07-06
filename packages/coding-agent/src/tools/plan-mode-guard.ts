@@ -111,7 +111,11 @@ export function targetsLocalSandbox(session: ToolSession, targetPath: string): b
  * filesystem path drives resolution — keeping the plan-mode guard and the
  * eventual write in lockstep.
  */
-export function resolvePlanPath(session: ToolSession, targetPath: string): string {
+export function resolvePlanPath(
+	session: ToolSession,
+	targetPath: string,
+	options?: { workspaceFallback?: boolean },
+): string {
 	const unwrapped = unwrapHashlineHeaderPath(targetPath);
 	const normalized = normalizeLocalScheme(unwrapped);
 	if (normalized.startsWith(LOCAL_SCHEME_PREFIX)) {
@@ -122,7 +126,44 @@ export function resolvePlanPath(session: ToolSession, targetPath: string): strin
 		return resolveVaultUrlToPath(normalized);
 	}
 
-	return resolveToCwd(normalized, session.cwd);
+	const resolved = resolveToCwd(normalized, session.cwd);
+	if (!options?.workspaceFallback) return resolved;
+	return resolveEditPathAcrossWorkspace(session, normalized, resolved);
+}
+
+/**
+ * Cross-root fallback for edits targeting EXISTING files: a relative path that
+ * misses under cwd resolves through the session's other workspace directories.
+ * A unique match is adopted; multiple matches throw so a mutation can never
+ * silently land in the wrong root. Callers must NOT enable this for create or
+ * rename-destination paths — those must stay cwd-anchored so a coincidental
+ * name in another root cannot capture a new file.
+ *
+ * Existence probes are sync because this sits behind the sync resolvePlanPath
+ * contract shared by all edit modes; at most `directories.length` stats run,
+ * and only on the miss path.
+ */
+function resolveEditPathAcrossWorkspace(session: ToolSession, inputPath: string, cwdResolved: string): string {
+	if (path.isAbsolute(inputPath) || inputPath.startsWith("~")) return cwdResolved;
+	if (fs.existsSync(cwdResolved)) return cwdResolved;
+	const directories = session.directories ?? [];
+	if (directories.length < 2) return cwdResolved;
+
+	const matches: string[] = [];
+	for (const directory of directories) {
+		const candidate = path.resolve(directory, inputPath);
+		if (candidate === cwdResolved) continue;
+		// Defense in depth: a `..`-escaping inputPath can resolve OUTSIDE the root
+		// it was resolved against; skip any candidate not contained within it.
+		if (!isWithinRoot(candidate, directory)) continue;
+		if (fs.existsSync(candidate)) matches.push(candidate);
+	}
+	if (matches.length > 1) {
+		throw new ToolError(
+			`Path '${inputPath}' exists in multiple workspace directories: ${matches.join(", ")}. Use an absolute path.`,
+		);
+	}
+	return matches[0] ?? cwdResolved;
 }
 
 /**

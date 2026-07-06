@@ -4493,6 +4493,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.#commandController.handleMoveCommand(targetPath);
 	}
 
+	handleAddDirCommand(): Promise<void> {
+		return this.#commandController.handleAddDirCommand();
+	}
+
+	handleRemoveDirCommand(): Promise<void> {
+		return this.#commandController.handleRemoveDirCommand();
+	}
+
 	handleRenameCommand(title: string): Promise<void> {
 		return this.#commandController.handleRenameCommand(title);
 	}

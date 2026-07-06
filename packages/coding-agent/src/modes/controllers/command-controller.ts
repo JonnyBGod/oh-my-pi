@@ -45,6 +45,7 @@ import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-stora
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
+import { addWorkspaceDirectory, removeWorkspaceDirectory } from "../../slash-commands/builtin-registry";
 import { formatActiveAccountLabel, limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
@@ -1088,6 +1089,51 @@ export class CommandController {
 			new Spacer(1),
 			new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
 		]);
+	}
+
+	/**
+	 * `/add-dir` with no argument (TUI only): open the directory-browse overlay,
+	 * then route the chosen directory through the shared add-directory logic so
+	 * the workspace-changed notice and system-prompt refresh stay in one place.
+	 */
+	async handleAddDirCommand(): Promise<void> {
+		const cwd = this.ctx.sessionManager.getCwd();
+		const result = await this.ctx.showHookCustom<MoveOverlayResult | undefined>(
+			(_tui, _theme, _keybindings, done) => new MoveOverlay(cwd, done, "Add directory to workspace"),
+			{ overlay: true },
+		);
+		if (!result) return; // cancelled
+		const outcome = await addWorkspaceDirectory(this.ctx.sessionManager, this.ctx.session, result.directory, cwd);
+		if (!outcome.ok) {
+			this.ctx.showError(outcome.message);
+			return;
+		}
+		this.ctx.showStatus(outcome.message);
+	}
+
+	/**
+	 * `/remove-dir` with no argument (TUI only): pick from the current additional
+	 * workspace roots via a selector, then route through the shared removal logic.
+	 */
+	async handleRemoveDirCommand(): Promise<void> {
+		const additional = this.ctx.sessionManager.getDirectories().slice(1);
+		if (additional.length === 0) {
+			this.ctx.showStatus("No additional workspace directories to remove.");
+			return;
+		}
+		const chosen = await this.ctx.showHookSelector("Remove workspace directory", additional);
+		if (!chosen) return; // cancelled
+		const outcome = await removeWorkspaceDirectory(
+			this.ctx.sessionManager,
+			this.ctx.session,
+			chosen,
+			this.ctx.sessionManager.getCwd(),
+		);
+		if (!outcome.ok) {
+			this.ctx.showError(outcome.message);
+			return;
+		}
+		this.ctx.showStatus(outcome.message);
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {

@@ -1060,7 +1060,7 @@ export async function executeReplaceSingle(
 		throw new Error("old_text must not be empty.");
 	}
 
-	const absolutePath = resolvePlanPath(session, path);
+	const absolutePath = resolvePlanPath(session, path, { workspaceFallback: true });
 	const rawContent = await readEditFileText(absolutePath, path);
 	const { bom, text: content } = stripBom(rawContent);
 	const originalEnding = detectLineEnding(content);

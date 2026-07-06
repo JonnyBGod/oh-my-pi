@@ -1813,7 +1813,9 @@ export async function executePatchSingle(
 	const op: Operation = rawOp === "create" || rawOp === "delete" ? rawOp : "update";
 
 	enforcePlanModeWrite(session, path, { op, move: rename });
-	const resolvedPath = resolvePlanPath(session, path);
+	// Rename destinations stay cwd-anchored: cross-root fallback only applies to
+	// paths naming an existing file, never to where a new name should appear.
+	const resolvedPath = resolvePlanPath(session, path, { workspaceFallback: op !== "create" });
 	const resolvedRename = rename ? resolvePlanPath(session, rename) : undefined;
 
 	await assertEditableFile(resolvedPath, path, session.settings);

@@ -5,7 +5,7 @@ import type { AgentSession } from "../../session/agent-session";
 import { AcpAgent } from "./acp-agent";
 
 /** Creates sessions requested by an ACP client. */
-export type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
+export type AcpSessionFactory = (cwd: string, additionalDirectories?: string[]) => Promise<AgentSession>;
 
 /** Creates an ACP connection and exposes its agent when process-level teardown must own it. */
 export function createAcpConnection(

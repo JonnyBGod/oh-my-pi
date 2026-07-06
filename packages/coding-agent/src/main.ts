@@ -348,7 +348,7 @@ export async function submitInteractiveInput(
 	}
 }
 
-type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
+type AcpSessionFactory = (cwd: string, additionalDirectories?: string[]) => Promise<AgentSession>;
 
 export interface AcpSessionFactoryOptions {
 	baseOptions: CreateAgentSessionOptions;
@@ -372,9 +372,9 @@ export interface AcpSessionFactoryOptions {
  * tool registry and shadow the client-supplied servers (issue #1234).
  */
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
-	return async cwd => {
+	return async (cwd, additionalDirectories) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
-		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
+		const nextSessionManager = SessionManager.create(cwd, args.sessionDir, undefined, { additionalDirectories });
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
@@ -857,6 +857,7 @@ export async function buildSessionOptions(
 ): Promise<CreateAgentSessionOptions> {
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
+		additionalDirectories: parsed.addDir,
 		autoApprove: parsed.autoApprove ?? false,
 	};
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));

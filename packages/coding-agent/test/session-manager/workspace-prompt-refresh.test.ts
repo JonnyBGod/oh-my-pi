@@ -12,14 +12,14 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 registerMockApi();
 
 /**
- * Contract: when `/add-dir` (or `addWorkspaceDirectory` + `refreshBaseSystemPrompt`)
+ * Contract: when `/add-dir` (`setAdditionalDirectories` + `refreshBaseSystemPrompt`)
  * runs mid-session, the rebuilt system prompt MUST list the newly-added directory
  * in its <workspace-roots> block. The sessionManager state updates immediately
  * (so `/dirs` reflects the add), but the system prompt is only re-read on the next
  * `refreshBaseSystemPrompt`; this test guards that refresh path end-to-end.
  */
 describe("workspace directories in the system prompt", () => {
-	it("adds a directory to the <workspace-roots> block after addWorkspaceDirectory + refreshBaseSystemPrompt", async () => {
+	it("adds a directory to the <workspace-roots> block after setAdditionalDirectories + refreshBaseSystemPrompt", async () => {
 		const dir = TempDir.createSync("@ws-prompt-add-");
 		const auth = await AuthStorage.create(path.join(dir.path(), "auth.db"));
 		try {
@@ -57,7 +57,7 @@ describe("workspace directories in the system prompt", () => {
 				expect(sessionManager.getAdditionalDirectories()).toEqual([extraDir]);
 
 				// Add a second directory live (as /add-dir does) and refresh the prompt.
-				await sessionManager.addWorkspaceDirectory(laterDir);
+				sessionManager.setAdditionalDirectories([...sessionManager.getAdditionalDirectories(), laterDir]);
 				await session.refreshBaseSystemPrompt();
 
 				// sessionManager state now has both.

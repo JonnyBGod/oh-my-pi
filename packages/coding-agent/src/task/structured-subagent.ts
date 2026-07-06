@@ -82,6 +82,8 @@ export interface StructuredSubagentRequest {
 	session: ToolSession;
 	invocationKind: "task" | "eval";
 	assignment: string;
+	/** Parent workspace directories beyond its cwd, inherited by the subagent; never the parent cwd. */
+	additionalDirectories?: string[];
 	context?: string;
 	agent?: string;
 	model?: string | string[];
@@ -377,7 +379,7 @@ function buildExecutorOptions(
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
 		cwd: session.cwd,
-		additionalDirectories: session.additionalDirectories,
+		additionalDirectories: request.additionalDirectories,
 		getApiKey: session.getApiKey,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
