@@ -1,7 +1,9 @@
 import * as path from "node:path";
 import { getRemoteDir } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../sdk";
+import { workspaceRootForPath } from "../session/session-workspace";
 import { findUniqueWorkspaceSuffix } from "./path-utils";
+import { ToolError } from "./tool-errors";
 
 // Remote mount path prefix (sshfs mounts) - skip fuzzy matching to avoid hangs
 const REMOTE_MOUNT_PREFIX = getRemoteDir() + path.sep;
@@ -33,4 +35,43 @@ export async function findSuffixMatchCached(
 	const result = await findUniqueWorkspaceSuffix(rawPath, session.cwd, signal);
 	cache.set(rawPath, result);
 	return result;
+}
+
+/**
+ * Resolve a relative path that missed under cwd against the session's other
+ * workspace directories. Exactly one existing match resolves; multiple matches
+ * throw so the caller can't silently read (or later edit) the wrong root.
+ */
+export async function resolveInWorkspaceDirectories(
+	session: ToolSession,
+	relativePath: string,
+	triedAbsolutePath: string,
+): Promise<{ absolutePath: string; size: number; isDirectory: boolean } | null> {
+	if (path.isAbsolute(relativePath) || relativePath.startsWith("~")) return null;
+	const directories = session.directories ?? [];
+	if (directories.length < 2) return null;
+
+	const matches: Array<{ absolutePath: string; size: number; isDirectory: boolean }> = [];
+	for (const directory of directories) {
+		const candidate = path.resolve(directory, relativePath);
+		if (candidate === triedAbsolutePath) continue;
+		// Defense in depth: a `..`-escaping relativePath can resolve OUTSIDE every
+		// declared root (e.g. roots [/repo, /ws/libs] + `../secret.txt` → /ws/secret.txt).
+		// Only adopt a candidate still contained within some declared root.
+		if (workspaceRootForPath(candidate, directories, "") === "") continue;
+		try {
+			const stat = await Bun.file(candidate).stat();
+			matches.push({ absolutePath: candidate, size: stat.size, isDirectory: stat.isDirectory() });
+		} catch (error) {
+			if (!isNotFoundError(error)) throw error;
+		}
+	}
+	if (matches.length > 1) {
+		throw new ToolError(
+			`Path '${relativePath}' exists in multiple workspace directories: ${matches
+				.map(match => match.absolutePath)
+				.join(", ")}. Use an absolute path.`,
+		);
+	}
+	return matches[0] ?? null;
 }

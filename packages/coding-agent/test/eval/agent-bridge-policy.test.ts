@@ -70,6 +70,7 @@ async function runEvalAgentAndWait(args: unknown, options: EvalAgentBridgeOption
 
 interface SessionOptions {
 	cwd?: string;
+	directories?: string[];
 	sessionFile?: string | null;
 	artifactsDir?: string | null;
 	spawns?: string | null;
@@ -96,6 +97,7 @@ function makeSession(options: SessionOptions = {}): ToolSession {
 	jobManagers.add(asyncJobManager);
 	return {
 		cwd: options.cwd ?? process.cwd(),
+		directories: options.directories,
 		hasUI: false,
 		settings,
 		asyncJobManager,
@@ -204,6 +206,17 @@ describe("runEvalAgent", () => {
 		expect(overrideResult.text).toBe("reviewer");
 		expect(runSpy.mock.calls[0]?.[0].agent.name).toBe("task");
 		expect(runSpy.mock.calls[1]?.[0].agent.name).toBe("reviewer");
+	});
+
+	it("forwards the parent workspace directories to the subagent, excluding cwd", async () => {
+		mockAgents();
+		const runSpy = vi.spyOn(taskExecutor, "runSubprocess").mockImplementation(async options => singleResult(options));
+		const cwd = process.cwd();
+		const session = makeSession({ cwd, directories: [cwd, "/tmp/docs-root", "/tmp/lib-root"] });
+
+		await runEvalAgent({ prompt: "hello" }, { session });
+
+		expect(runSpy.mock.calls[0]?.[0].additionalDirectories).toEqual(["/tmp/docs-root", "/tmp/lib-root"]);
 	});
 
 	it("throws for an unknown agent", async () => {

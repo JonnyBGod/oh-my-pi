@@ -158,6 +158,49 @@ describe("computeBankScope", () => {
 			expect(scope.retainTags).toEqual(["project:general"]);
 			expect(scope.recallTags).toEqual(["project:general"]);
 		});
+
+		describe("multi-root recall union", () => {
+			it("unions every root's project tag into recall while retain stays on the primary root", () => {
+				const scope = computeBankScope(baseConfig({ scoping: "per-project-tagged" }), "/work/repo-a", [
+					"/work/repo-a",
+					"/work/repo-b",
+				]);
+				// Retain is attributed to the primary (cwd) root only.
+				expect(scope.retainTags).toEqual(["project:repo-a"]);
+				// Recall spans both roots' tags, cwd first, with `any` match so
+				// untagged global memories still surface.
+				expect(scope.recallTags).toEqual(["project:repo-a", "project:repo-b"]);
+				expect(scope.recallTagsMatch).toBe("any");
+				// The single shared bank is unchanged.
+				expect(scope.bankId).toBe("omp");
+			});
+
+			it("dedupes repeated roots so a tag is not filtered on twice", () => {
+				const scope = computeBankScope(baseConfig({ scoping: "per-project-tagged" }), "/work/repo-a", [
+					"/work/repo-a",
+					"/work/repo-a",
+				]);
+				expect(scope.recallTags).toEqual(["project:repo-a"]);
+			});
+
+			it("single-root explicit [cwd] is identical to the omitted-directories scope", () => {
+				const omitted = computeBankScope(baseConfig({ scoping: "per-project-tagged" }), "/work/repo-a");
+				const explicit = computeBankScope(baseConfig({ scoping: "per-project-tagged" }), "/work/repo-a", [
+					"/work/repo-a",
+				]);
+				expect(explicit).toEqual(omitted);
+			});
+		});
+	});
+
+	describe("scoping=per-project (multi-root does not fan out)", () => {
+		it("keeps recall anchored to the primary root's bank (union is a follow-up)", () => {
+			const scope = computeBankScope(baseConfig({ scoping: "per-project" }), "/work/repo-a", [
+				"/work/repo-a",
+				"/work/repo-b",
+			]);
+			expect(scope).toEqual({ bankId: "omp-repo-a" });
+		});
 	});
 
 	// Regression for #2232: linked git worktrees used to silo memory into

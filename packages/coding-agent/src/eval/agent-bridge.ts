@@ -215,6 +215,9 @@ export async function runEvalAgent(args: unknown, options: EvalAgentBridgeOption
 						session: options.session,
 						invocationKind: "eval",
 						assignment: parsed.prompt,
+						additionalDirectories: options.session.directories?.filter(
+							directory => directory !== options.session.cwd,
+						),
 						...(parsed.agent !== undefined ? { agent: parsed.agent } : {}),
 						...(Object.hasOwn(parsed, "schema") ? { outputSchema: parsed.schema } : {}),
 						...(parsed.schemaMode !== undefined ? { schemaMode: parsed.schemaMode } : {}),

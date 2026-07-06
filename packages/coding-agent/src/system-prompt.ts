@@ -35,6 +35,7 @@ import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" w
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
 import { normalizeConcurrencyLimit } from "./task/parallel";
+import { shortenPath } from "./tools/render-utils";
 import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
 import { normalizePromptPath } from "./utils/prompt-path";
 import { AGENTS_MD_LIMIT, buildWorkspaceTree, type WorkspaceTree } from "./workspace-tree";
@@ -608,8 +609,11 @@ export interface BuildSystemPromptOptions {
 	skillsSettings?: SkillsSettings;
 	/** Working directory. Default: getProjectDir() */
 	cwd?: string;
-	/** Additional workspace directories beyond cwd (multi-root), absolute. Injected into the project prompt. */
-	additionalWorkspaceRoots?: string[];
+	/**
+	 * Session workspace directories beyond cwd (ordered, absolute). Each gets
+	 * its own workspace tree and context-file discovery in the project prompt.
+	 */
+	additionalDirectories?: string[];
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -703,7 +707,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		toolNames: providedToolNames,
 		directToolNames,
 		cwd,
-		additionalWorkspaceRoots = [],
+		additionalDirectories,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		rules,
@@ -736,6 +740,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	} = options;
 	const inlineToolDescriptors = providedInlineToolDescriptors ?? false;
 	const resolvedCwd = cwd ?? getProjectDir();
+	const extraWorkspaceDirectories = Array.from(
+		new Set((additionalDirectories ?? []).map(directory => path.resolve(directory))),
+	).filter(directory => directory !== path.resolve(resolvedCwd));
 
 	const prepDefaults = {
 		resolvedCustomPrompt: undefined as string | undefined,
@@ -753,6 +760,8 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		activeRepoContext: null as ActiveRepoContext | null,
 		cpuModel: undefined as string | undefined,
 		gpu: undefined as string | undefined,
+		additionalWorkspaceTrees: [] as WorkspaceTree[],
+		additionalContextFiles: [] as Array<{ path: string; content: string; depth?: number }>,
 	};
 
 	const { promise: deadline, resolve: fireDeadline } = Promise.withResolvers<"__timeout__">();
@@ -795,42 +804,64 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const systemPromptCustomizationPromise: Promise<string | null> = callerControlsCustomPrompt
 		? Promise.resolve(null)
 		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
-	const contextFilesPromise = (async () => {
-		const primary = providedContextFiles
-			? providedContextFiles
-			: await logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
-		// Also discover context files (AGENTS.md, rules, etc.) for each additional workspace root.
-		const additionalRoots = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
-		if (additionalRoots.length === 0) return primary;
-		const extra = await Promise.all(
-			additionalRoots.map(root => loadProjectContextFiles({ cwd: root }).catch(() => [])),
-		);
-		return dedupeContainedContextFiles([...primary, ...extra.flat()]);
-	})();
-	const additionalRootsForTree = additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd));
-	const workspaceTreePromise = (async () => {
-		const primary =
-			providedWorkspaceTree !== undefined
-				? await Promise.resolve(providedWorkspaceTree)
-				: includeWorkspaceTree
-					? await logger.time("buildWorkspaceTree", () =>
-							buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
-						)
-					: { rootPath: resolvedCwd, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] };
-		if (additionalRootsForTree.length === 0 || !includeWorkspaceTree) return primary;
-		const extraTrees = await Promise.all(
-			additionalRootsForTree.map(root =>
-				buildWorkspaceTree(root, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }).catch(() => ({
-					rootPath: root,
-					rendered: "",
-					truncated: false,
-					totalLines: 0,
-					agentsMdFiles: [],
-				})),
-			),
-		);
-		return { ...primary, agentsMdFiles: [...primary.agentsMdFiles, ...extraTrees.flatMap(t => t.agentsMdFiles)] };
-	})();
+	const contextFilesPromise = providedContextFiles
+		? Promise.resolve(providedContextFiles)
+		: logger.time("loadProjectContextFiles", loadProjectContextFiles, { cwd: resolvedCwd });
+	const workspaceTreePromise =
+		providedWorkspaceTree !== undefined
+			? Promise.resolve(providedWorkspaceTree)
+			: includeWorkspaceTree
+				? logger.time("buildWorkspaceTree", () =>
+						buildWorkspaceTree(resolvedCwd, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }),
+					)
+				: Promise.resolve({
+						rootPath: resolvedCwd,
+						rendered: "",
+						truncated: false,
+						totalLines: 0,
+						agentsMdFiles: [],
+					});
+	// Additional workspace roots get the same discovery treatment as cwd (per
+	// the ACP additional-directories contract): a workspace tree and context
+	// files per root. Both are always discovered here — `providedWorkspaceTree`
+	// and `providedContextFiles` only cover the primary cwd.
+	const additionalWorkspaceTreesPromise: Promise<WorkspaceTree[]> =
+		extraWorkspaceDirectories.length === 0
+			? Promise.resolve([])
+			: includeWorkspaceTree
+				? logger.time("buildAdditionalWorkspaceTrees", () =>
+						Promise.all(
+							extraWorkspaceDirectories.map(directory =>
+								buildWorkspaceTree(directory, { timeoutMs: SYSTEM_PROMPT_PREP_TIMEOUT_MS }).catch(() => ({
+									rootPath: directory,
+									rendered: "",
+									truncated: false,
+									totalLines: 0,
+									agentsMdFiles: [],
+								})),
+							),
+						),
+					)
+				: Promise.resolve(
+						extraWorkspaceDirectories.map(directory => ({
+							rootPath: directory,
+							rendered: "",
+							truncated: false,
+							totalLines: 0,
+							agentsMdFiles: [],
+						})),
+					);
+	const additionalContextFilesPromise: Promise<Array<{ path: string; content: string; depth?: number }>> =
+		extraWorkspaceDirectories.length === 0
+			? Promise.resolve([])
+			: logger.time("loadAdditionalContextFiles", async () => {
+					const perRoot = await Promise.all(
+						extraWorkspaceDirectories.map(directory =>
+							loadProjectContextFiles({ cwd: directory }).catch(() => []),
+						),
+					);
+					return perRoot.flat();
+				});
 	const skillsPromise: Promise<readonly Skill[]> =
 		providedSkills !== undefined
 			? Promise.resolve(providedSkills)
@@ -856,13 +887,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
 		systemPromptCustomization,
-		contextFiles,
+		primaryContextFiles,
 		skills,
 		workspaceTree,
 		activeRepoContext,
 		cpuModel,
 		gpu,
 		personalityBlock,
+		additionalWorkspaceTrees,
+		additionalContextFiles,
 	] = await Promise.all([
 		withDeadline(
 			"customPrompt",
@@ -888,9 +921,27 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		withDeadline("getCpuModel", cpuModelPromise, prepDefaults.cpuModel),
 		withDeadline("getCachedGpu", gpuPromise, prepDefaults.gpu),
 		withDeadline("loadPersonalityOverride", personalityPromise, bundledPersonality),
+		withDeadline(
+			"buildAdditionalWorkspaceTrees",
+			additionalWorkspaceTreesPromise,
+			prepDefaults.additionalWorkspaceTrees,
+		),
+		withDeadline("loadAdditionalContextFiles", additionalContextFilesPromise, prepDefaults.additionalContextFiles),
 	]);
 	clearTimeout(deadlineTimer);
-	const agentsMdFiles = Array.from(new Set(workspaceTree.agentsMdFiles)).sort().slice(0, AGENTS_MD_LIMIT);
+	// Additional-root files come first so equal-depth primary-cwd context stays
+	// last (most prominent); paragraph-contained duplicates collapse by authority.
+	const contextFiles = dedupeContainedContextFiles([...additionalContextFiles, ...primaryContextFiles]);
+	// Primary-tree entries are cwd-relative; entries from additional roots are
+	// absolutized so the dir-context list stays unambiguous across roots.
+	const agentsMdFiles = Array.from(
+		new Set([
+			...workspaceTree.agentsMdFiles,
+			...additionalWorkspaceTrees.flatMap(tree => tree.agentsMdFiles.map(file => path.join(tree.rootPath, file))),
+		]),
+	)
+		.sort()
+		.slice(0, AGENTS_MD_LIMIT);
 
 	if (timedOut.length > 0) {
 		logger.warn("System prompt preparation steps timed out; using minimal fallback for those steps", {
@@ -999,11 +1050,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		contextFiles,
 		agentsMdSearch: { files: agentsMdFiles },
 		workspaceTree,
+		additionalWorkspaceRoots: additionalWorkspaceTrees.map(tree => ({
+			path: shortenPath(normalizePromptPath(tree.rootPath)),
+			rendered: tree.rendered,
+			truncated: tree.truncated,
+		})),
 		skills: filteredSkills,
 		rules: rules ?? [],
 		alwaysApplyRules: injectedAlwaysApplyRules,
 		cwd: promptCwd,
-		additionalWorkspaceRoots: additionalWorkspaceRoots.filter(d => path.resolve(d) !== path.resolve(resolvedCwd)),
 		model: includeModelInPrompt ? (model ?? "") : "",
 		delegationBias,
 		personality: personalityBlock,

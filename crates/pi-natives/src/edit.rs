@@ -70,6 +70,9 @@ pub struct EditPolicy {
 	pub enforce_seen_lines:   bool,
 	pub block_auto_generated: bool,
 	pub plan_active:          bool,
+	/// Additional workspace roots beyond `cwd`; missing authored paths may
+	/// recover into these by unique suffix match.
+	pub workspace_dirs:       Option<Vec<String>>,
 	/// Root of the `local://` artifact sandbox; null when the session has none.
 	pub local_sandbox_root:   Option<String>,
 	/// Cached vault roots; null when the vault protocol is disabled.
@@ -86,6 +89,12 @@ impl EditPolicy {
 			policy:             PathPolicy {
 				cwd:                  PathBuf::from(self.cwd),
 				home_dir:             PathBuf::from(self.home_dir),
+				workspace_dirs:       self
+					.workspace_dirs
+					.unwrap_or_default()
+					.into_iter()
+					.map(PathBuf::from)
+					.collect(),
 				local_sandbox_root:   self.local_sandbox_root.map(PathBuf::from),
 				vault_roots:          self.vault_roots.map(|roots| {
 					roots
@@ -668,6 +677,7 @@ pub fn edit_auto_generated_message(absolute_path: String, display_path: String) 
 	let policy = PathPolicy {
 		cwd:                  PathBuf::new(),
 		home_dir:             PathBuf::new(),
+		workspace_dirs:       Vec::new(),
 		local_sandbox_root:   None,
 		vault_roots:          None,
 		plan_active:          false,
