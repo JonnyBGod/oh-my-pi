@@ -22,13 +22,16 @@ import type { AgentSessionEventListener } from "@oh-my-pi/pi-coding-agent/sessio
 interface FakeSessionDeps {
 	sessionId: string | null;
 	cwd?: string;
+	directories?: string[];
 	entries?: Array<{ role: "user" | "assistant"; text: string }>;
 	settings?: Settings;
 }
 
 function makeFakeSession(deps: FakeSessionDeps) {
 	const listeners = new Set<AgentSessionEventListener>();
+	const workspaceListeners = new Set<(previous: string[], next: string[]) => void>();
 	const entries = deps.entries ?? [];
+	let directories = deps.directories ?? [deps.cwd ?? "/tmp"];
 	let hindsightState: HindsightSessionState | undefined;
 	const session = {
 		sessionId: deps.sessionId,
@@ -59,8 +62,13 @@ function makeFakeSession(deps: FakeSessionDeps) {
 								},
 				})),
 			getCwd: () => deps.cwd ?? "/tmp",
+			getDirectories: () => directories,
 			getSessionFile: () => null,
 			getSessionId: () => deps.sessionId ?? "",
+			onWorkspaceDirectoriesChanged(cb: (previous: string[], next: string[]) => void) {
+				workspaceListeners.add(cb);
+				return () => workspaceListeners.delete(cb);
+			},
 		},
 		subscribe(listener: AgentSessionEventListener) {
 			listeners.add(listener);
@@ -77,6 +85,13 @@ function makeFakeSession(deps: FakeSessionDeps) {
 			// oxlint-disable-next-line unicorn/no-useless-spread -- listeners may change during dispatch
 			for (const l of [...listeners]) l(event);
 		},
+		/** Drive the workspace-change signal exactly as `setAdditionalDirectories` would. */
+		emitWorkspaceChange(next: string[]) {
+			const previous = directories;
+			directories = next;
+			for (const l of [...workspaceListeners]) l(previous, next);
+		},
+		workspaceListenerCount: () => workspaceListeners.size,
 		listenerCount: () => listeners.size,
 	};
 	return session;
@@ -123,6 +138,75 @@ describe("hindsightBackend.start", () => {
 
 		expect(session.getHindsightSessionState()).toBeDefined();
 		expect(session.getHindsightSessionState()?.bankId).toBeTruthy();
+	});
+
+	it("rebuilds the primary state when workspace roots change mid-session", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.scoping": "per-project-tagged",
+			"hindsight.mentalModelsEnabled": false,
+		});
+		const session = makeFakeSession({
+			sessionId: "ws1",
+			cwd: "/work/alpha",
+			directories: ["/work/alpha"],
+			settings,
+		});
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		const before = session.getHindsightSessionState();
+		expect(before?.recallTags).toHaveLength(1);
+		const refreshed = Promise.withResolvers<void>();
+		session.refreshBaseSystemPrompt.mockImplementation(async () => refreshed.resolve());
+
+		// Add a second root: `computeBankScope` unions each root's project tag.
+		session.emitWorkspaceChange(["/work/alpha", "/work/beta"]);
+		await refreshed.promise;
+
+		const after = session.getHindsightSessionState();
+		expect(after).toBeDefined();
+		expect(after).not.toBe(before);
+		expect(after?.recallTags).toHaveLength(2);
+		// The rebuilt state owns the fresh subscription; the old one was released.
+		expect(session.workspaceListenerCount()).toBe(1);
+	});
+
+	it("does not rebuild when the workspace signal fires with an unchanged scope", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.scoping": "per-project-tagged",
+			"hindsight.mentalModelsEnabled": false,
+		});
+		const session = makeFakeSession({
+			sessionId: "ws2",
+			cwd: "/work/alpha",
+			directories: ["/work/alpha"],
+			settings,
+		});
+
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: {} as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const before = session.getHindsightSessionState();
+
+		// Same set — `bankScopesEqual` must short-circuit the rebuild.
+		session.emitWorkspaceChange(["/work/alpha"]);
+		await rebindMemoryBackendForCwd(session as never);
+
+		expect(session.getHindsightSessionState()).toBe(before);
 	});
 
 	it("rekeys state when the same AgentSession gets a new session id (resume/switch)", async () => {

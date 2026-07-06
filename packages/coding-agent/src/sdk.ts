@@ -30,7 +30,7 @@ import { isOpenAICodexWebSocketPreferred } from "@oh-my-pi/pi-ai/providers/opena
 import { FALLBACK_DIALECT, preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { $env, $flag } from "@oh-my-pi/pi-utils/env";
-import { getAgentDir, getModelDbPath, getProjectDir } from "@oh-my-pi/pi-utils/dirs";
+import { directoryExists, getAgentDir, getModelDbPath, getProjectDir } from "@oh-my-pi/pi-utils/dirs";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import * as prompt from "@oh-my-pi/pi-utils/prompt";
@@ -381,8 +381,6 @@ function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
-	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
-	additionalDirectories?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
@@ -630,6 +628,13 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: session stored under the configured agentDir sessions root */
 	sessionManager?: SessionManager;
+
+	/**
+	 * Workspace directories beyond cwd to ADD to the session (CLI `--add-dir`).
+	 * Applied additively after the session manager resolves, so resumed sessions
+	 * keep their persisted workspace and gain these on top.
+	 */
+	additionalDirectories?: string[];
 
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
@@ -959,6 +964,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	/** Session workspace directories beyond cwd (ordered, absolute). */
+	additionalDirectories?: string[];
 	customPrompt?: string;
 	/** Raw Handlebars template replacing the bundled default system prompt rendering. */
 	systemPromptTemplate?: string;
@@ -990,6 +997,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		: undefined;
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		additionalDirectories: options.additionalDirectories,
 		customPrompt: options.customPrompt,
 		systemPromptTemplate: options.systemPromptTemplate,
 		skills: options.skills,
@@ -1489,14 +1497,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
-	const configuredDirs = options.additionalDirectories
-		? options.additionalDirectories
-		: settings.get("workspace.additionalDirectories");
-	if (configuredDirs.length > 0) {
-		// Merge with any roots restored from the session header (resume/fork), not replace.
-		const existing = sessionManager.getAdditionalDirectories();
-		const merged = [...new Set([...existing, ...configuredDirs])];
-		await sessionManager.setAdditionalDirectories(merged);
+	// Workspace root merge order (RFC R1): persisted session directories, then
+	// settings-configured roots (project settings over user settings via the
+	// normal settings layering), then explicit CLI/embedding-provided entries.
+	// Normalization dedupes, so re-applying on resume is idempotent.
+	const configuredDirectories = settings.get("workspace.additionalDirectories");
+	const startupDirectories = [...configuredDirectories, ...(options.additionalDirectories ?? [])];
+	if (startupDirectories.length > 0) {
+		await sessionManager.setAdditionalDirectories([
+			...sessionManager.getDirectories().slice(1),
+			...startupDirectories,
+		]);
+		for (const directory of sessionManager.getDirectories().slice(1)) {
+			if (!(await directoryExists(directory))) {
+				logger.warn("Configured workspace directory does not exist", { directory });
+			}
+		}
 	}
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	if (options.credentialSourceSessionId) {
@@ -1852,6 +1868,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			isToolActive: name => activeToolNames.has(name),
 			setActiveToolNames,
 			toolRegistry,
+			get directories() {
+				return sessionManager.getDirectories();
+			},
 			hasUI: options.hasUI ?? false,
 			canPromptUser: options.interactivePrompts ?? options.hasUI ?? false,
 			// Explicit resolvers retain their existing pass-through contract. Ordinary
@@ -3355,11 +3374,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
-				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				xdevTools: toolSession.xdev ? xdevEntries(toolSession.xdev) : [],
 				xdevDocs: toolSession.xdev
 					? xdevDocsAll(toolSession.xdev, settings.get("tools.xdevDocs"), settings.get("tools.xdevInlineDevices"))
 					: "",
+				additionalDirectories: sessionManager.getDirectories().slice(1),
 				resolvedCustomPrompt: options.customSystemPrompt,
 				systemPromptTemplate: options.systemPromptTemplate,
 				skills: settings.get("skillful") ? (session?.skills ?? skills) : [],
@@ -3862,6 +3881,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			get skillHintVisible() {
 				return toolSession.skillHintVisible;
+			},
+			get directories() {
+				return sessionManager.getDirectories();
 			},
 			hasEditTool: true,
 			requireYieldTool: false,

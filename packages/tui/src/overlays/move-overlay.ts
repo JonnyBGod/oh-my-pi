@@ -44,15 +44,22 @@ export class MoveOverlay implements Component, Focusable {
 	#results: MoveDirectoryEntry[] = [];
 	#cwd: string;
 	#source: MoveDirectorySource;
+	#title: string;
 	#done: (result: MoveOverlayResult | undefined) => void;
 	#revision = 0;
 	#renderMemo:
 		| { width: number; fieldLines: readonly string[]; revision: number; lines: readonly string[] }
 		| undefined;
 
-	constructor(cwd: string, done: (result: MoveOverlayResult | undefined) => void, source: MoveDirectorySource) {
+	constructor(
+		cwd: string,
+		done: (result: MoveOverlayResult | undefined) => void,
+		source: MoveDirectorySource,
+		title = "Move to directory",
+	) {
 		this.#cwd = cwd;
 		this.#source = source;
+		this.#title = title;
 		this.#done = done;
 		this.#field = new TextFormField({
 			theme: formTheme,
@@ -142,7 +149,7 @@ export class MoveOverlay implements Component, Focusable {
 		}
 		const lines: string[] = [];
 
-		lines.push(topBorder(w, "Move to directory"));
+		lines.push(topBorder(w, this.#title));
 		for (const fieldLine of fieldLines) {
 			lines.push(row(fieldLine, w));
 		}

@@ -6604,6 +6604,14 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#btwController.withSessionMove(operation);
 	}
 
+	handleAddDirCommand(): Promise<void> {
+		return this.#commandController.handleAddDirCommand();
+	}
+
+	handleRemoveDirCommand(): Promise<void> {
+		return this.#commandController.handleRemoveDirCommand();
+	}
+
 	handleRenameCommand(title: string): Promise<void> {
 		return this.#commandController.handleRenameCommand(title);
 	}

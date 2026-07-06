@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import { isEnoent, logger, once, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
+import { workspaceRootForPath } from "../session/session-workspace";
 import { isPermissionDeniedError, writeFileWithFallback } from "../tools/file-write-fallback";
 import { beginPendingDiskWrite, endPendingDiskWrite, FileChangeType, notifyWorkspaceWatchedFiles } from "./client";
 import { getConfig, getServersForFile } from "./config";
@@ -31,6 +32,12 @@ export interface WritethroughOptions {
 	deferredSignal?: AbortSignal;
 	/** Transform diagnostics before surfacing them after a successful fetch. */
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
+	/**
+	 * Session workspace directories (cwd first). When set, each written file's
+	 * LSP root is the workspace directory containing it — unrelated roots never
+	 * share one server rooted at the session cwd.
+	 */
+	directories?: string[];
 }
 
 /** Internal resolved form of {@link WritethroughOptions} that the writethrough machinery operates on. */
@@ -38,6 +45,7 @@ type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
 	transformDiagnostics?: (absPath: string, result: FileDiagnosticsResult) => FileDiagnosticsResult;
+	directories?: string[];
 };
 
 /** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
@@ -296,7 +304,7 @@ async function fetchDiagnosticsWithDeferral(args: {
 async function runLspWritethrough(
 	dst: string,
 	content: string,
-	cwd: string,
+	sessionCwd: string,
 	options: ResolvedWritethroughOptions,
 	changeType: FileChangeType,
 	signal?: AbortSignal,
@@ -309,6 +317,9 @@ async function runLspWritethrough(
 ): Promise<WritethroughResult> {
 	const { enableFormat, enableDiagnostics } = options;
 	const contentAlreadyWritten = runOptions?.contentAlreadyWritten ?? false;
+	// Per-file LSP root: the workspace directory containing the written file.
+	// Everything below (config, client spawn, sync, diagnostics) keys on it.
+	const cwd = workspaceRootForPath(dst, options.directories, sessionCwd);
 
 	let finalContent = content;
 	const writeContent = async (value: string) => writeFileWithFallback(dst, value, file);
@@ -546,6 +557,7 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
+		directories: options?.directories,
 		transformDiagnostics: options?.transformDiagnostics,
 	};
 	return async (

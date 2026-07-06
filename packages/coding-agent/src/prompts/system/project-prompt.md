@@ -39,11 +39,19 @@ Working-directory layout: newest mtime first; depth ≤ 3.
 </workspace-tree>
 {{/if}}
 {{/if}}
+
 {{#if additionalWorkspaceRoots.length}}
 <workspace-roots>
-Additional workspace directories. This CURRENT workspace state supersedes workspace changes mentioned earlier in the conversation. {{#ifAny (includes tools "read") (includes tools "grep") (includes tools "glob") (includes tools "edit")}}Use absolute paths under these roots to {{#has tools "read"}}`{{toolRefs.read}}`{{/has}}{{#has tools "grep"}}{{#ifAny (includes tools "read")}}/{{/ifAny}}`{{toolRefs.grep}}`{{/has}}{{#has tools "glob"}}{{#ifAny (includes tools "read") (includes tools "grep")}}/{{/ifAny}}`{{toolRefs.glob}}`{{/has}}{{#has tools "edit"}}{{#ifAny (includes tools "read") (includes tools "grep") (includes tools "glob")}}/{{/ifAny}}`{{toolRefs.edit}}`{{/has}}.{{/ifAny}} Manage with `/add-dir` and `/remove-dir`; `/dirs` lists them.
+Additional workspace directories. This CURRENT workspace state supersedes workspace changes mentioned earlier in the conversation. `grep`/`glob` cover all workspace directories by default; relative paths resolve against the working directory first, then fall back to a unique match in another workspace directory. {{#ifAny (includes tools "read") (includes tools "grep") (includes tools "glob") (includes tools "edit")}}Use absolute paths under these roots to {{#has tools "read"}}`{{toolRefs.read}}`{{/has}}{{#has tools "grep"}}{{#ifAny (includes tools "read")}}/{{/ifAny}}`{{toolRefs.grep}}`{{/has}}{{#has tools "glob"}}{{#ifAny (includes tools "read") (includes tools "grep")}}/{{/ifAny}}`{{toolRefs.glob}}`{{/has}}{{#has tools "edit"}}{{#ifAny (includes tools "read") (includes tools "grep") (includes tools "glob")}}/{{/ifAny}}`{{toolRefs.edit}}`{{/has}}.{{/ifAny}} Manage with `/add-dir` and `/remove-dir`; `/dirs` lists them.
 {{#each additionalWorkspaceRoots}}
-- {{this}}
+<root path="{{path}}">
+{{#if rendered}}
+{{rendered}}
+{{#if truncated}}
+(some entries elided — use `glob`/`read` to drill in)
+{{/if}}
+{{/if}}
+</root>
 {{/each}}
 </workspace-roots>
 {{/if}}

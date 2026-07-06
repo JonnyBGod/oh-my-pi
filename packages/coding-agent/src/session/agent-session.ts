@@ -164,6 +164,7 @@ import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-ur
 import { hasNativeJudge, journalJudgmentUsage, resolveJudge } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/hub";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { shutdownClientsForRoot } from "../lsp/client";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -630,6 +631,7 @@ export class AgentSession {
 	#unsubscribeModelRoles?: () => void;
 	#unsubscribeExtendedContext?: () => void;
 	#unsubscribeCodeMode?: () => void;
+	#unsubscribeWorkspaceLsp?: () => void;
 	#unsubscribeEvalPreludeSettings?: () => void;
 	#unsubscribeIdleCloseSetting?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
@@ -2087,6 +2089,18 @@ export class AgentSession {
 		// its refreshed same-selector entry (#10488) once discovery settles.
 		void this.#retryInactiveAdvisorAfterModelDiscovery();
 		void this.#revalidateFallbackChainsAfterModelDiscovery();
+		// Tear down LSP clients for roots dropped from the workspace mid-session
+		// (`/remove-dir`). Adds are left to lazy spawn on first use. LSP clients
+		// are module-global and keyed by root, so this only needs the removed set.
+		this.#unsubscribeWorkspaceLsp = this.sessionManager.onWorkspaceDirectoriesChanged((previous, next) => {
+			const retained = new Set(next);
+			for (const root of previous) {
+				if (retained.has(root)) continue;
+				void shutdownClientsForRoot(root).catch(err => {
+					logger.debug("LSP: workspace-root client shutdown failed", { root, error: String(err) });
+				});
+			}
+		});
 		if (config.rebindModelAfterDiscovery) void this.#rebindActiveModelAfterModelDiscovery();
 	}
 	/** Model registry for API key resolution and model discovery */
@@ -4966,6 +4980,10 @@ export class AgentSession {
 		if (this.#unsubscribeIdleCloseSetting) {
 			this.#unsubscribeIdleCloseSetting();
 			this.#unsubscribeIdleCloseSetting = undefined;
+		}
+		if (this.#unsubscribeWorkspaceLsp) {
+			this.#unsubscribeWorkspaceLsp();
+			this.#unsubscribeWorkspaceLsp = undefined;
 		}
 		this.#eventListeners = [];
 		this.#runStateListeners.clear();

@@ -28,7 +28,10 @@ export interface ReadToolDetails {
 	truncation?: ReadTruncationStats;
 	isDirectory?: boolean;
 	resolvedPath?: string;
-	suffixResolution?: { from: string; to: string };
+	/** Set when the executing tool resolved a missing path to an existing one;
+	 * `via` names the recovery mechanism (e.g. `workspace directory`) and falls back
+	 * to the suffix-match wording when absent. */
+	suffixResolution?: { from: string; to: string; via?: string };
 	url?: string;
 	finalUrl?: string;
 	contentType?: string;

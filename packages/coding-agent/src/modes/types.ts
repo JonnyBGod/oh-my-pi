@@ -444,6 +444,8 @@ export interface InteractiveModeContext {
 	/** `/wt`: fork the checkout into a new worktree (keeping changes) and move there. */
 	handleWorktreeCommand(branch?: string): Promise<void>;
 	withBtwSessionMove(operation: () => Promise<boolean>): Promise<boolean>;
+	handleAddDirCommand(): Promise<void>;
+	handleRemoveDirCommand(): Promise<void>;
 	handleRenameCommand(title: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
 	handleSTTToggle(): Promise<void>;
