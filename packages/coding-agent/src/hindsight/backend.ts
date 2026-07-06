@@ -269,7 +269,7 @@ async function installPrimaryState(
 	if (!isHindsightConfigured(config)) return undefined;
 
 	const client = createHindsightClient(config);
-	const scope = computeBankScope(config, session.sessionManager.getCwd());
+	const scope = computeBankScope(config, session.sessionManager.getCwd(), session.sessionManager.getDirectories());
 
 	// Cleanup any stale state for this session (defensive — prevents leaks
 	// when a session is reused without going through dispose). Flush the
@@ -300,6 +300,13 @@ async function installPrimaryState(
 		banksSet,
 		lastRetainedTurn: 0,
 		hasRecalledForFirstTurn: false,
+	});
+
+	// A mid-session workspace-root change (`/add-dir`, `/remove-dir`) moves the
+	// bank scope exactly like a `hindsight.scoping` edit — `computeBankScope`
+	// reads the directories live — so route it through the same rebuild.
+	state.unsubscribeWorkspace = session.sessionManager.onWorkspaceDirectoriesChanged(() => {
+		schedulePrimaryStateRebuild(session);
 	});
 
 	const displaced = session.setHindsightSessionState(state);
@@ -353,7 +360,7 @@ async function reconcilePrimaryState(session: AgentSession): Promise<boolean> {
 	}
 	if (!current) return false;
 
-	const next = computeBankScope(config, session.sessionManager.getCwd());
+	const next = computeBankScope(config, session.sessionManager.getCwd(), session.sessionManager.getDirectories());
 	if (bankScopesEqual(next, current) && hindsightConfigsEqual(current.config, config)) return false;
 
 	// A confirmed bank includes its mission metadata, not just its server/id.

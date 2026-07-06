@@ -43,6 +43,10 @@ pub struct UrlResolution {
 pub struct PathPolicy {
 	pub cwd:                  PathBuf,
 	pub home_dir:             PathBuf,
+	/// Additional workspace roots. Authored paths that miss under `cwd` may
+	/// recover into these by unique suffix match; empty in single-root
+	/// sessions.
+	pub workspace_dirs:       Vec<PathBuf>,
 	/// Registered internal URL schemes, lowercase, without `://` (host
 	/// router's spec keys).
 	pub url_schemes:          Vec<String>,
@@ -167,7 +171,9 @@ impl PathPolicy {
 	}
 
 	/// Locate a missing authored path by unique trailing-suffix match under
-	/// `cwd`.
+	/// `cwd`, then each additional workspace root. Exactly one match across
+	/// all roots recovers; zero or several recover nothing, so a single-root
+	/// session behaves exactly like a `cwd`-only search.
 	pub fn recover_missing(&self, authored: &str) -> Option<Resolved> {
 		let normalized = authored.replace('\\', "/");
 		let normalized = normalized
@@ -179,30 +185,39 @@ impl PathPolicy {
 		}
 		let escaped = escape_glob_metachars(normalized);
 		let glob = pi_walker::CompiledWalkGlob::new([format!("**/{escaped}")]).ok()?;
-		let started = Instant::now();
-		let request = pi_walker::WalkRequest::new(&self.cwd)
-			.hidden(true)
-			.gitignore(true)
-			.skip_git(true)
-			.skip_node_modules(false)
-			.emit_root(false)
-			.cache(false)
-			.limit(2)
-			.filter(pi_walker::WalkFilter::all().glob(glob));
-		let result = request
-			.collect_with_heartbeat(|| {
-				if started.elapsed() >= Duration::from_secs(5) {
-					Err("workspace suffix search timed out")
-				} else {
-					Ok(())
-				}
-			})
-			.ok()?;
-		if result.entries.len() != 1 {
+		let mut candidates = Vec::new();
+		for root in std::iter::once(&self.cwd).chain(self.workspace_dirs.iter()) {
+			let started = Instant::now();
+			let request = pi_walker::WalkRequest::new(root)
+				.hidden(true)
+				.gitignore(true)
+				.skip_git(true)
+				.skip_node_modules(false)
+				.emit_root(false)
+				.cache(false)
+				.limit(2)
+				.filter(pi_walker::WalkFilter::all().glob(glob.clone()));
+			let result = request
+				.collect_with_heartbeat(|| {
+					if started.elapsed() >= Duration::from_secs(5) {
+						Err("workspace suffix search timed out")
+					} else {
+						Ok(())
+					}
+				})
+				.ok();
+			if let Some(result) = result
+				&& result.entries.len() == 1
+				&& let Some(entry) = result.entries.into_iter().next()
+			{
+				candidates.push((root, entry.path));
+			}
+		}
+		if candidates.len() != 1 {
 			return None;
 		}
-		let display = result.entries.into_iter().next()?.path;
-		Some(Resolved { absolute: self.cwd.join(&display), display })
+		let (root, display) = candidates.pop()?;
+		Some(Resolved { absolute: root.join(&display), display })
 	}
 
 	/// Enforce plan-mode write restrictions: renames and deletes are refused;
@@ -270,8 +285,13 @@ impl PathPolicy {
 		// cwd (std canonicalize on Windows) never component-matches the cleaned
 		// store-key form `C:\…`, silently rejecting every recovery.
 		let recovered = strip_windows_verbatim_path(lexical_absolute(recovered, &self.cwd));
-		let root = strip_windows_verbatim_path(lexical_absolute(&self.cwd, &self.cwd));
-		is_within(&recovered, &root) || self.in_plan_writable_root(&recovered)
+		std::iter::once(&self.cwd)
+			.chain(self.workspace_dirs.iter())
+			.any(|root| {
+				let root = strip_windows_verbatim_path(lexical_absolute(root, &self.cwd));
+				is_within(&recovered, &root)
+			})
+			|| self.in_plan_writable_root(&recovered)
 	}
 
 	/// Return the model-facing generated-file rejection, when applicable.
@@ -681,6 +701,7 @@ mod tests {
 		PathPolicy {
 			cwd:                  root.to_owned(),
 			home_dir:             root.join("home"),
+			workspace_dirs:       Vec::new(),
 			url_schemes:          vec!["sbx".into(), "ro".into()],
 			url_alias_schemes:    vec!["sbx".into()],
 			plan_writable_roots:  vec![root.join("sandbox")],
@@ -908,6 +929,39 @@ mod tests {
 		std::fs::create_dir_all(tmp.path().join("other/src")).unwrap();
 		std::fs::write(tmp.path().join("other/src/a.ts"), "").unwrap();
 		assert!(p.recover_missing("src/a.ts").is_none());
+	}
+
+	#[test]
+	fn recovers_missing_path_into_unique_additional_workspace_root() {
+		let tmp = tempfile::tempdir().unwrap();
+		let docs = tempfile::tempdir().unwrap();
+		let libs = tempfile::tempdir().unwrap();
+		let mut p = policy(tmp.path());
+		p.workspace_dirs.push(docs.path().to_owned());
+
+		std::fs::create_dir_all(docs.path().join("src")).unwrap();
+		std::fs::write(docs.path().join("src/guide.md"), "").unwrap();
+		let recovered = p.recover_missing("src/guide.md").unwrap();
+		assert_eq!(recovered.absolute, docs.path().join("src/guide.md"));
+		assert_eq!(recovered.display, "src/guide.md");
+
+		// The same suffix in a second additional root is ambiguous: no recovery.
+		std::fs::create_dir_all(libs.path().join("src")).unwrap();
+		std::fs::write(libs.path().join("src/guide.md"), "").unwrap();
+		p.workspace_dirs.push(libs.path().to_owned());
+		assert!(p.recover_missing("src/guide.md").is_none());
+	}
+
+	#[test]
+	fn tag_recovery_reaches_additional_workspace_roots_only() {
+		let tmp = tempfile::tempdir().unwrap();
+		let docs = tempfile::tempdir().unwrap();
+		let mut p = policy(tmp.path());
+		p.workspace_dirs.push(docs.path().to_owned());
+		assert!(p.allow_tag_path_recovery("guide.md", &docs.path().join("src/guide.md")));
+		assert!(
+			!p.allow_tag_path_recovery("escape.ts", &docs.path().parent().unwrap().join("escape.ts"))
+		);
 	}
 
 	#[test]

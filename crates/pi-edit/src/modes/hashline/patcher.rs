@@ -838,6 +838,7 @@ mod lifecycle {
 			let policy = PathPolicy {
 				cwd:                  dir.path().to_owned(),
 				home_dir:             dir.path().to_owned(),
+				workspace_dirs:       Vec::new(),
 				url_schemes:          Vec::new(),
 				url_alias_schemes:    Vec::new(),
 				plan_writable_roots:  Vec::new(),

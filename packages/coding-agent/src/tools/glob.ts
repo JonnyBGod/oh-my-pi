@@ -1,5 +1,6 @@
 import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import * as natives from "@oh-my-pi/pi-natives";
@@ -7,6 +8,7 @@ import { formatGroupedPaths, hasFsCode, isEnoent, prompt, untilAborted } from "@
 import { InternalUrlRouter, sessionResolveContext } from "../internal-urls";
 import { InternalUrlFilesystem, type UrlFileStat } from "../internal-urls/url-filesystem";
 import globDescription from "../prompts/tools/glob.md" with { type: "text" };
+import { workspaceRootForPath } from "../session/session-workspace";
 import { truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
@@ -201,9 +203,26 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				context: sessionResolveContext(this.session, { signal }),
 				tier: resolveToolTier(this, params),
 			});
-			const normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
+			let normalizedPatterns = aliasResolvedPatterns.map(pattern => internalRouter.normalize(pattern));
 			if (normalizedPatterns.some(pattern => pattern.length === 0)) {
 				throw new ToolError("`path` must contain non-empty globs or paths");
+			}
+
+			// Multi-root sessions: each relative glob expands against every session
+			// workspace directory — the whole workspace is in scope, exactly like
+			// cwd. Absolute (and ~) patterns already name their root, and internal
+			// URLs resolve inside the native walk, so both pass through unchanged.
+			// The missing-path partition below then drops per-root variants that
+			// don't exist.
+			if (!this.#customOps) {
+				const directories = this.session.directories ?? [];
+				if (directories.length > 1) {
+					normalizedPatterns = normalizedPatterns.flatMap(pattern =>
+						path.isAbsolute(pattern) || pattern.startsWith("~") || internalRouter.canHandle(pattern)
+							? [pattern]
+							: directories.map(directory => `${directory}/${pattern}`),
+					);
+				}
 			}
 
 			// Tolerate missing entries in a multi-path call: skip ones whose base
@@ -620,6 +639,57 @@ export class GlobTool implements AgentTool<typeof findSchema, GlobToolDetails> {
 				}
 			}
 			merged.sort((a, b) => b.mtime - a.mtime);
+
+			// Multi-root fairness: a pure mtime cut lets one actively-edited root
+			// evict every other root's matches from the capped list — the caller
+			// then can't tell the other roots were searched at all. Guarantee each
+			// root a share of the cap, fill the remainder by global recency, and
+			// say which root contributed how many.
+			const sessionDirectories = this.session.directories ?? [];
+			if (sessionDirectories.length > 1 && merged.length > effectiveLimit) {
+				const byRoot = new Map<string, Array<{ path: string; mtime: number }>>();
+				for (const entry of merged) {
+					const absolute = path.resolve(this.session.cwd, entry.path);
+					const root = workspaceRootForPath(absolute, sessionDirectories, this.session.cwd);
+					const bucket = byRoot.get(root);
+					if (bucket) bucket.push(entry);
+					else byRoot.set(root, [entry]);
+				}
+				if (byRoot.size > 1) {
+					const quota = Math.ceil(effectiveLimit / byRoot.size);
+					const selected: Array<{ path: string; mtime: number }> = [];
+					const leftovers: Array<{ path: string; mtime: number }> = [];
+					for (const bucket of byRoot.values()) {
+						selected.push(...bucket.slice(0, quota));
+						leftovers.push(...bucket.slice(quota));
+					}
+					leftovers.sort((a, b) => b.mtime - a.mtime);
+					while (selected.length < effectiveLimit && leftovers.length > 0) {
+						selected.push(leftovers.shift()!);
+					}
+					selected.sort((a, b) => b.mtime - a.mtime);
+					const capped = selected.slice(0, effectiveLimit);
+					const shownByRoot = new Map<string, number>();
+					for (const entry of capped) {
+						const absolute = path.resolve(this.session.cwd, entry.path);
+						const root = workspaceRootForPath(absolute, sessionDirectories, this.session.cwd);
+						shownByRoot.set(root, (shownByRoot.get(root) ?? 0) + 1);
+					}
+					const breakdown = Array.from(byRoot.entries())
+						.map(([root, bucket]) => {
+							const label = formatPathRelativeToCwd(root, this.session.cwd) || ".";
+							return `${label}: ${shownByRoot.get(root) ?? 0} shown of ${bucket.length}+ matched`;
+						})
+						.join("; ");
+					return buildResult(
+						capped.map(entry => entry.path),
+						{
+							notice: `Result cap reached; per-root breakdown — ${breakdown}. Narrow the pattern per root for more.`,
+							forceTruncated: true,
+						},
+					);
+				}
+			}
 			return buildResult(merged.map(entry => entry.path));
 		});
 		return execution.finally(() => {

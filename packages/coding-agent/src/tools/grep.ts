@@ -24,6 +24,7 @@ import { sessionResolveContext } from "../internal-urls/context";
 import { InternalUrlRouter } from "../internal-urls/router";
 import { InternalUrlFilesystem } from "../internal-urls/url-filesystem";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
+import { workspaceRootForPath } from "../session/session-workspace";
 import { DEFAULT_MAX_COLUMN, truncateHead } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { sessionDelegationBias } from "../task/prompt-policy";
 import { isScoutSpawnable } from "../task/spawn-policy";
@@ -492,7 +493,11 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				throw new ToolError("Skip must be a non-negative number");
 			}
 			const scopedPaths = toPathList(rawPath);
-			const effectivePaths = scopedPaths.length > 0 ? scopedPaths : ["."];
+			// Path-less searches span the whole session workspace: every workspace
+			// directory is in scope, exactly like cwd. Explicit paths narrow.
+			const workspaceDirectories = this.session.directories ?? [];
+			const effectivePaths =
+				scopedPaths.length > 0 ? scopedPaths : workspaceDirectories.length > 1 ? workspaceDirectories : ["."];
 			const rawEntries = await expandDelimitedPathEntries(effectivePaths, this.session.cwd);
 			const pathSpecs = await parsePathSpecs(rawEntries, this.session.cwd);
 			const resolveContext = sessionResolveContext(this.session, { signal });
@@ -785,28 +790,73 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const fileWindow = this.#totalMatchLimit !== undefined ? this.#totalMatchLimit + 1 : DEFAULT_FILE_LIMIT;
 				const windowStart = canPaginate ? normalizedSkip : 0;
 				const windowEnd = canPaginate ? normalizedSkip + fileWindow : Number.POSITIVE_INFINITY;
-				// Group matches by file in encounter order. Every file is counted so
-				// per-file overflow is detected BEFORE truncation (the renderer surfaces
-				// that a hot file was trimmed for diversity), but match lists are only
-				// kept — already capped — for files inside the page window.
+				// Multi-root fairness (mirrors glob's per-root quota). A path-less
+				// grep auto-scopes every workspace directory and matches arrive in
+				// target order, so encounter order front-loads the first root
+				// (usually cwd); a greedy file window then fills entirely from that
+				// root, starving the others even when they matched. Reorder the
+				// files by root — round-robin, the pagination-safe generalization
+				// of glob's equal cap/numRoots quota — before window selection, so
+				// each page hands every root a fair share. Only engages for the
+				// auto workspace scope with matches spanning >1 root and more files
+				// than one page holds; explicit-path and single-root scopes keep
+				// encounter order byte-for-byte.
+				const fileMatchLists = new Map<string, GrepMatch[]>();
+				const fileOrder: string[] = [];
+				for (const match of result.matches) {
+					const list = fileMatchLists.get(match.path);
+					if (list) list.push(match);
+					else {
+						fileMatchLists.set(match.path, [match]);
+						fileOrder.push(match.path);
+					}
+				}
+				const rootOfFile = (file: string): string =>
+					workspaceRootForPath(resolveSearchResultPath(searchPath, file), workspaceDirectories, this.session.cwd);
+				if (
+					scopedPaths.length === 0 &&
+					workspaceDirectories.length > 1 &&
+					isMultiScope &&
+					fileOrder.length > DEFAULT_FILE_LIMIT
+				) {
+					const buckets = new Map<string, string[]>();
+					for (const file of fileOrder) {
+						const root = rootOfFile(file);
+						const bucket = buckets.get(root);
+						if (bucket) bucket.push(file);
+						else buckets.set(root, [file]);
+					}
+					if (buckets.size > 1) {
+						const lists = [...buckets.values()];
+						const fair: string[] = [];
+						for (let cursor = 0; fair.length < fileOrder.length; cursor++) {
+							for (const list of lists) {
+								if (cursor < list.length) fair.push(list[cursor]);
+							}
+						}
+						fileOrder.splice(0, fileOrder.length, ...fair);
+					}
+				}
+				const windowFiles = canPaginate ? fileOrder.slice(windowStart, windowEnd) : fileOrder;
+				// Group matches by file. Every file is counted so per-file overflow
+				// is detected BEFORE truncation (the renderer surfaces that a hot
+				// file was trimmed for diversity), but match lists are only kept —
+				// already capped — for files inside the page window.
 				const fileGroups = new Map<string, { count: number; list?: GrepMatch[] }>();
 				const windowLists: GrepMatch[][] = [];
 				let perFileLimitReached = false;
-				for (const match of result.matches) {
-					const group = fileGroups.get(match.path);
-					if (!group) {
-						const order = fileGroups.size;
-						const list = order >= windowStart && order < windowEnd ? [match] : undefined;
-						if (list) windowLists.push(list);
-						fileGroups.set(match.path, { count: 1, list });
+				for (let order = 0; order < fileOrder.length; order++) {
+					const file = fileOrder[order];
+					const all = fileMatchLists.get(file)!;
+					if (all.length > perFileMatchCap) perFileLimitReached = true;
+					const inWindow = order >= windowStart && order < windowEnd;
+					if (!inWindow) {
+						fileGroups.set(file, { count: all.length, list: undefined });
 						continue;
 					}
-					group.count++;
-					if (group.count > perFileMatchCap) {
-						perFileLimitReached = true;
-						continue;
-					}
-					group.list?.push(match);
+					const list = all.length > perFileMatchCap ? all.slice(0, perFileMatchCap) : all;
+					fileGroups.set(file, { count: all.length, list });
+					windowLists.push(list);
 				}
 				const totalFiles = fileGroups.size;
 				// When native grep stopped at its internal cap, files past the cap were
@@ -840,6 +890,35 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const limitMessage = fileLimitReached
 					? `Showing files ${skipFiles + 1}-${nextSkip} of ${totalFilesLabel}. Use skip=${nextSkip} for the next page, or narrow paths/pattern.`
 					: "";
+				// Multi-root visibility: mtime/encounter ordering front-loads the hot
+				// root, so page 1 can look cwd-only while other roots matched further
+				// down. A per-root shown/matched header makes cross-root coverage
+				// visible without paginating.
+				let workspaceBreakdown = "";
+				if (workspaceDirectories.length > 1) {
+					const totalByRoot = new Map<string, number>();
+					for (const file of fileOrder) {
+						const root = rootOfFile(file);
+						totalByRoot.set(root, (totalByRoot.get(root) ?? 0) + 1);
+					}
+					if (totalByRoot.size > 1) {
+						const shownByRoot = new Map<string, number>();
+						for (const file of windowFiles) {
+							const root = rootOfFile(file);
+							shownByRoot.set(root, (shownByRoot.get(root) ?? 0) + 1);
+						}
+						workspaceBreakdown = `Workspace roots: ${[...totalByRoot.entries()]
+							.map(([root, total]) => {
+								const label = formatPathRelativeToCwd(root, this.session.cwd) || ".";
+								const shown = shownByRoot.get(root) ?? 0;
+								const totalLabel = `${total}${result.limitReached ? "+" : ""}`;
+								return shown === total && !result.limitReached
+									? `${label}: ${total} file${total === 1 ? "" : "s"}`
+									: `${label}: ${shown} shown of ${totalLabel} matched`;
+							})
+							.join("; ")}`;
+					}
+				}
 				const { record: recordFile, list: fileList } = createFileRecorder();
 				const fileMatchCounts = new Map<string, number>();
 				// Detect explicit file targets that exceed the native grep size cap.
@@ -1002,6 +1081,10 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 				const matchOutput = formatFileMatches(fileList, isDirectory || isMultiScope, renderMatchesForFile);
 				outputLines.push(...matchOutput.model);
 				displayLines.push(...matchOutput.display);
+				if (workspaceBreakdown) {
+					outputLines.unshift(workspaceBreakdown, "");
+					displayLines.unshift(workspaceBreakdown, "");
+				}
 				if (limitMessage) {
 					outputLines.push("", limitMessage);
 				}

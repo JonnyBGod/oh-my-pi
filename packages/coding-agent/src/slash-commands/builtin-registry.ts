@@ -14,6 +14,9 @@ import {
 } from "./builtin-completions";
 import { BUILTIN_CONTROL_SLASH_COMMANDS } from "./builtin-control";
 import { BUILTIN_LIFECYCLE_SLASH_COMMANDS } from "./builtin-lifecycle";
+
+export { addWorkspaceDirectory, removeWorkspaceDirectory, type WorkspaceDirOutcome } from "./builtin-lifecycle";
+
 import { BUILTIN_MARKETPLACE_SLASH_COMMANDS, reloadTuiPluginState } from "./builtin-marketplace";
 import { BUILTIN_MODE_SLASH_COMMANDS } from "./builtin-modes";
 import { BUILTIN_SESSION_SLASH_COMMANDS } from "./builtin-session";
@@ -72,6 +75,7 @@ export const BUILTIN_SLASH_COMMAND_DEFS: ReadonlyArray<BuiltinSlashCommand> = BU
 		icon: command.icon,
 		subcommands: command.subcommands,
 		inlineHint: command.inlineHint,
+		dirArgCompletions: command.dirArgCompletions,
 		getTuiAutocompleteDescription: command.getTuiAutocompleteDescription,
 	}),
 );
@@ -95,7 +99,7 @@ function materializeTuiBuiltinSlashCommand(
 			materialized.getArgumentCompletions = buildArgumentCompletions(subcommands);
 			materialized.getInlineHint = buildSubcommandInlineHint(subcommands);
 		}
-	} else if (cmd.name === "move") {
+	} else if (cmd.name === "move" || cmd.dirArgCompletions) {
 		materialized.getArgumentCompletions = buildDirectoryArgumentCompletions();
 		if (cmd.inlineHint) materialized.getInlineHint = buildStaticInlineHint(cmd.inlineHint);
 	} else if (cmd.name === "switch" && runtime) {

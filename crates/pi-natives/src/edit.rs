@@ -68,6 +68,9 @@ pub struct EditPolicy {
 	pub enforce_seen_lines:   bool,
 	pub block_auto_generated: bool,
 	pub plan_active:          bool,
+	/// Additional workspace roots beyond `cwd`; missing authored paths may
+	/// recover into these by unique suffix match.
+	pub workspace_dirs:       Option<Vec<String>>,
 	/// Registered internal URL schemes (router spec keys).
 	pub url_schemes:          Vec<String>,
 	/// The `urlSchemes` whose single-slash `scheme:/x` spelling aliases
@@ -87,6 +90,12 @@ impl EditPolicy {
 			policy:             PathPolicy {
 				cwd:                  PathBuf::from(self.cwd),
 				home_dir:             PathBuf::from(self.home_dir),
+				workspace_dirs:       self
+					.workspace_dirs
+					.unwrap_or_default()
+					.into_iter()
+					.map(PathBuf::from)
+					.collect(),
 				url_schemes:          self.url_schemes,
 				url_alias_schemes:    self.url_alias_schemes,
 				plan_writable_roots:  self
@@ -846,6 +855,7 @@ pub fn edit_auto_generated_message(absolute_path: String, display_path: String) 
 	let policy = PathPolicy {
 		cwd:                  PathBuf::new(),
 		home_dir:             PathBuf::new(),
+		workspace_dirs:       Vec::new(),
 		url_schemes:          Vec::new(),
 		url_alias_schemes:    Vec::new(),
 		plan_writable_roots:  Vec::new(),
@@ -962,6 +972,7 @@ mod tests {
 			policy:             PathPolicy {
 				cwd:                  cwd.to_path_buf(),
 				home_dir:             cwd.to_path_buf(),
+				workspace_dirs:       Vec::new(),
 				url_schemes:          Vec::new(),
 				url_alias_schemes:    Vec::new(),
 				plan_writable_roots:  Vec::new(),

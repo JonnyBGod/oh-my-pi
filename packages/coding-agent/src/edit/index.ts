@@ -179,6 +179,7 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 				transformDiagnostics: deduplicate
 					? (filePath, result) => getDiagnosticsLedger(session).reduce(filePath, result)
 					: undefined,
+				directories: session.directories,
 			})
 		: writethroughNoop;
 }
@@ -607,6 +608,9 @@ export class EditTool implements AgentTool<TInput> {
 			urlSchemes: [...specs.keys()],
 			urlAliasSchemes,
 			planWritableRoots: router.sandboxRoots(context),
+			// Additional roots only: recovery into them never applies to
+			// create/rename destinations, which resolve through `cwd` alone.
+			workspaceDirs: this.session.directories?.slice(1),
 			homeDir: os.homedir(),
 			rawInput,
 		};

@@ -83,26 +83,46 @@ function projectLabel(directory: string): string {
  *
  * Always returns a non-empty `bankId`. Tag fields are populated only for
  * `per-project-tagged`.
+ *
+ * `directories` is the cwd-first workspace root list for a multi-root session.
+ * In `per-project-tagged`, recall unions each root's `project:<name>` tag so
+ * the agent surfaces memories from every repo the session spans, while retain
+ * stays anchored to the primary (`directory`) root's tag. `directories`
+ * defaults to `[directory]`, so single-root sessions behave exactly as before.
  */
-export function computeBankScope(config: HindsightConfig, directory: string): BankScope {
+export function computeBankScope(
+	config: HindsightConfig,
+	directory: string,
+	directories: readonly string[] = [directory],
+): BankScope {
 	const base = baseBankId(config);
 	switch (config.scoping) {
 		case "global":
 			return { bankId: base };
 		case "per-project":
+			// Multi-root recall union is a deliberate follow-up here: unlike the
+			// tagged mode (one bank filtered by tags), per-project hard-isolates
+			// each root in its own bank, so unioning recall would need N recall
+			// HTTP calls plus a client-side merge. Until that lands, per-project
+			// recall stays anchored to the primary (cwd) root's bank.
 			return { bankId: `${base}-${projectLabel(directory)}` };
 		case "per-project-tagged": {
-			const tag = `${PROJECT_TAG_PREFIX}${projectLabel(directory)}`;
+			const retainTag = `${PROJECT_TAG_PREFIX}${projectLabel(directory)}`;
+			const recallTags = uniqueStrings(directories.map(root => `${PROJECT_TAG_PREFIX}${projectLabel(root)}`));
 			return {
 				bankId: base,
-				retainTags: [tag],
-				recallTags: [tag],
+				retainTags: [retainTag],
+				recallTags,
 				// `any` keeps untagged "global" memories visible alongside the
 				// project-tagged ones; flip to `*_strict` to harden isolation.
 				recallTagsMatch: "any",
 			};
 		}
 	}
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+	return [...new Set(values)];
 }
 
 /**

@@ -11,6 +11,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import { createSyntheticToolResultMessage } from "@oh-my-pi/pi-agent-core";
 import {
+	directoryExists,
 	directoryIsEnterable,
 	directoryIsMissing,
 	getBlobsDir,
@@ -113,6 +114,7 @@ import {
 	additionalWorkspaceDirectories,
 	normalizeSessionWorkspace,
 	normalizeWorkspaceDirectory,
+	type SessionWorkspace,
 } from "./session-workspace";
 import { recordSessionRecap, recordSessionTitle } from "./session-index";
 
@@ -847,9 +849,16 @@ export class ForkSourceNotFoundError extends Error {
  * A trailing atomic rewrite still rewrites the header cwd after the path is
  * repointed.
  */
+/** Order-independent equality of two normalized workspace-directory lists. */
+function sameDirectorySet(a: string[], b: string[]): boolean {
+	if (a.length !== b.length) return false;
+	const set = new Set(a);
+	return b.every(directory => set.has(directory));
+}
+
 export class SessionManager {
 	#cwd: string;
-	/** Additional workspace directories beyond cwd (multi-root). Normalized absolute, deduped, excludes cwd. */
+	/** Ordered workspace directories beyond `#cwd` (absolute, normalized, deduped, never containing `#cwd`). */
 	#additionalDirectories: string[] = [];
 	#fallbackRuntimeOnly = false;
 	#sessionDir: string;
@@ -973,6 +982,7 @@ export class SessionManager {
 	 * {@link #moveOffSessionFile}, {@link createBranchedSession}). Never rejects.
 	 */
 	#pendingArtifactCopy: { sessionFile: string; done: Promise<void> } | undefined;
+	#workspaceDirectoriesChangedCallbacks = new Set<(previous: string[], next: string[]) => void>();
 
 	private constructor(cwd: string, sessionDir: string, persist: boolean, storage: SessionStorage) {
 		this.#cwd = cwd;
@@ -1958,17 +1968,16 @@ export class SessionManager {
 			id: this.#sessionId,
 			timestamp,
 			cwd: this.#cwd,
+			additionalDirectories: this.#headerAdditionalDirectories(),
 			parentSession: options?.parentSession,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 		};
-		const workspace = normalizeSessionWorkspace({
-			cwd: this.#cwd,
-			directories: options?.additionalDirectories ?? [],
-		});
-		this.#additionalDirectories = additionalWorkspaceDirectories(workspace);
-		if (this.#additionalDirectories.length > 0) {
-			this.#header.additionalDirectories = [...this.#additionalDirectories];
+		// An explicit list overrides; otherwise keep the directories already adopted
+		// (e.g. seeded via `SessionManager.create({ additionalDirectories })`).
+		if (options?.additionalDirectories !== undefined) {
+			this.#adoptAdditionalDirectories(options.additionalDirectories);
 		}
+		this.#header.additionalDirectories = this.#headerAdditionalDirectories();
 		this.#titleUpdatedAt = timestamp;
 
 		this.#entries = [];
@@ -2009,6 +2018,7 @@ export class SessionManager {
 		this.#titleUpdatedAt = header.timestamp;
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
+		this.#adoptAdditionalDirectories(header.additionalDirectories ?? []);
 		this.#index.rebuild(entries);
 	}
 
@@ -2125,6 +2135,16 @@ export class SessionManager {
 				callback();
 			} catch (err) {
 				logger.warn("SessionManager: session name change hook failed", { error: String(err) });
+			}
+		}
+	}
+
+	#notifyWorkspaceDirectoriesListeners(previous: string[], next: string[]): void {
+		for (const callback of [...this.#workspaceDirectoriesChangedCallbacks]) {
+			try {
+				callback(previous, next);
+			} catch (err) {
+				logger.warn("SessionManager: workspace directories change hook failed", { error: String(err) });
 			}
 		}
 	}
@@ -2338,7 +2358,17 @@ export class SessionManager {
 
 		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
 		this.#expectedDiskSize = sourceSize;
-		this.#additionalDirectories = header.additionalDirectories ?? [];
+		// Missing additional workspace directories warn but never block a resume:
+		// the session stays usable through its (validated) cwd. `#applyEntries`
+		// already adopted `header.additionalDirectories` (normalized against cwd).
+		for (const directory of this.#additionalDirectories) {
+			if (!(await directoryExists(directory))) {
+				logger.warn("Session workspace directory no longer exists", {
+					directory,
+					sessionFile: resolvedSessionFile,
+				});
+			}
+		}
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
 		this.#fileIsCurrent = true;
@@ -2399,7 +2429,7 @@ export class SessionManager {
 			titleSource: this.#header.titleSource ?? this.#titleSource,
 			timestamp,
 			cwd: this.#cwd,
-			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
+			additionalDirectories: this.#headerAdditionalDirectories(),
 			parentSession: parentSessionId,
 			providerPromptCacheKey: this.#header.providerPromptCacheKey ?? parentSessionId,
 		};
@@ -2602,15 +2632,11 @@ export class SessionManager {
 			// Clear only after the rename has landed. If the move threw,
 			// keep the flag so the next relocation retries.
 			this.#fallbackRuntimeOnly = false;
-			if (this.#additionalDirectories.length === 0) {
-				this.#header.additionalDirectories = undefined;
-			} else {
-				// Re-filter additional roots: the new cwd may have been an
-				// additional root, or it may now contain one.
-				this.#additionalDirectories = this.#additionalDirectories.filter(d => d !== resolvedCwd);
-				this.#header.additionalDirectories =
-					this.#additionalDirectories.length > 0 ? this.#additionalDirectories : undefined;
-			}
+			// Re-normalize additional roots: the new cwd may have been an additional
+			// directory. Keep the invariant that #additionalDirectories never
+			// contains #cwd.
+			this.#adoptAdditionalDirectories(this.#additionalDirectories);
+			this.#header.additionalDirectories = this.#headerAdditionalDirectories();
 
 			// Rewrite at the new location when the file already existed (update cwd) or
 			// there is in-memory output worth materializing; otherwise stay lazy.
@@ -2661,6 +2687,21 @@ export class SessionManager {
 		manager.#forceFileCreation = true;
 		await manager.#rewriteAtomically();
 		return manager;
+	}
+
+	/**
+	 * Eagerly persist a mid-session workspace directory change to disk so a hard
+	 * crash between `/add-dir` (or `/remove-dir`) and the next turn cannot lose
+	 * the just-changed root. Unlike {@link ensureOnDisk} this never forces file
+	 * creation: it writes only when the session already qualifies for a durable
+	 * file (`#shouldHaveSessionFile`), so in-memory/no-file sessions (subagents,
+	 * session-adopt-time) no-op. Reuses the atomic-rewrite path and is itself a
+	 * no-op while no header rewrite is pending.
+	 */
+	async persistWorkspaceChange(): Promise<void> {
+		if (!this.#persist || !this.#sessionFile || !this.#shouldHaveSessionFile()) return;
+		if (this.#fileIsCurrent && !this.#rewriteRequired) return;
+		await this.#rewriteAtomically();
 	}
 
 	/**
@@ -2977,9 +3018,44 @@ export class SessionManager {
 		}
 	}
 
+	/** Normalized session workspace: `cwd` plus the ordered workspace directories. */
+	getWorkspace(): SessionWorkspace {
+		return normalizeSessionWorkspace({ cwd: this.#cwd, directories: this.#additionalDirectories });
+	}
+
+	/** Ordered workspace directories, `cwd` first. */
+	getDirectories(): string[] {
+		return this.getWorkspace().directories;
+	}
+
 	/** Additional workspace directories beyond cwd (multi-root), absolute and normalized. */
 	getAdditionalDirectories(): string[] {
 		return [...this.#additionalDirectories];
+	}
+
+	/**
+	 * Replace the workspace directories beyond `cwd`. The list is normalized
+	 * against the current cwd; entries equal to `cwd` are dropped. Also called on
+	 * resumed sessions with `--add-dir`; persists the updated header when the
+	 * session file is already durable. No-op when the normalized list is
+	 * unchanged (adopt-time re-application at SDK startup, ACP re-apply, subagent
+	 * spawn) so large session files are not rewritten for nothing.
+	 */
+	async setAdditionalDirectories(directories: string[]): Promise<void> {
+		const previous = this.getDirectories();
+		this.#adoptAdditionalDirectories(directories);
+		const next = this.getDirectories();
+		// Only notify when the normalized directory SET actually moved so
+		// idempotent adopts don't tear down and rebuild live LSP/memory state.
+		if (!sameDirectorySet(previous, next)) {
+			this.#notifyWorkspaceDirectoriesListeners(previous, next);
+		}
+		// In fallback the transcript is still in the stale bucket; keep workspace
+		// edits runtime-only until relocation.
+		if (this.#fallbackRuntimeOnly) return;
+		if (previous.length === next.length && previous.every((directory, i) => directory === next[i])) return;
+		this.#header.additionalDirectories = this.#headerAdditionalDirectories();
+		await this.#persistWorkspaceDirectoriesChange();
 	}
 
 	/**
@@ -3006,13 +3082,16 @@ export class SessionManager {
 			throw new Error("The current working directory is already the primary workspace root.");
 		}
 		if (this.#additionalDirectories.includes(resolved)) return null;
+		const previous = this.getDirectories();
 		this.#additionalDirectories = [...this.#additionalDirectories, resolved];
+		const next = this.getDirectories();
+		this.#notifyWorkspaceDirectoriesListeners(previous, next);
 		// In fallback the transcript is still in the stale bucket; keep
 		// workspace edits runtime-only until relocation.
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
-		this.#header.additionalDirectories = this.#additionalDirectories;
+		this.#header.additionalDirectories = this.#headerAdditionalDirectories();
 		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
 	}
@@ -3026,42 +3105,28 @@ export class SessionManager {
 		const resolved = normalizeWorkspaceDirectory(directory, this.#cwd);
 		const idx = this.#additionalDirectories.findIndex(p => path.resolve(p) === resolved);
 		if (idx === -1) return null;
+		const previous = this.getDirectories();
 		this.#additionalDirectories = this.#additionalDirectories.filter((_, i) => i !== idx);
+		const next = this.getDirectories();
+		this.#notifyWorkspaceDirectoriesListeners(previous, next);
 		// In fallback keep edits runtime-only until relocation.
 		if (this.#fallbackRuntimeOnly) {
 			return resolved;
 		}
-		if (this.#additionalDirectories.length === 0) {
-			this.#header.additionalDirectories = undefined;
-		} else {
-			this.#header.additionalDirectories = this.#additionalDirectories;
-		}
+		this.#header.additionalDirectories = this.#headerAdditionalDirectories();
 		await this.#persistWorkspaceDirectoriesChange();
 		return resolved;
 	}
 
-	/** Seed additional directories from settings or a passed list. Also called on resumed sessions with --add-dir; persists the updated header when the session file is already durable. No-op when the normalized list is unchanged (avoids rewriting large session files on every startup). */
-	async setAdditionalDirectories(directories: string[]): Promise<void> {
+	/** Normalize and adopt additional directories relative to the current `#cwd`. */
+	#adoptAdditionalDirectories(directories: string[]): void {
 		const workspace = normalizeSessionWorkspace({ cwd: this.#cwd, directories });
-		const next = additionalWorkspaceDirectories(workspace);
-		// In fallback keep edits runtime-only until relocation.
-		if (this.#fallbackRuntimeOnly) {
-			this.#additionalDirectories = next;
-			return;
-		}
-		if (
-			next.length === this.#additionalDirectories.length &&
-			next.every((d, i) => d === this.#additionalDirectories[i])
-		) {
-			return;
-		}
-		this.#additionalDirectories = next;
-		if (this.#additionalDirectories.length > 0) {
-			this.#header.additionalDirectories = this.#additionalDirectories;
-		} else {
-			this.#header.additionalDirectories = undefined;
-		}
-		await this.#persistWorkspaceDirectoriesChange();
+		this.#additionalDirectories = additionalWorkspaceDirectories(workspace);
+	}
+
+	/** Header value for the additional directories: a copy, or absent when single-root. */
+	#headerAdditionalDirectories(): string[] | undefined {
+		return this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined;
 	}
 
 	getUsageStatistics(): UsageStatistics {
@@ -3259,6 +3324,21 @@ export class SessionManager {
 		this.#persistenceNoticeCallbacks.add(cb);
 		return () => {
 			this.#persistenceNoticeCallbacks.delete(cb);
+		};
+	}
+
+	/**
+	 * Subscribe to mid-session workspace-directory changes. The callback receives
+	 * the previous and new cwd-first directory lists so subscribers can diff them
+	 * — e.g. LSP teardown of removed roots, or Hindsight/mnemopi recall-scope
+	 * rebuilds. Fires only when {@link setAdditionalDirectories} actually changes
+	 * the directory set; idempotent session-adopt calls are suppressed. Returns an
+	 * unsubscribe function; subscribers MUST release it on their own dispose.
+	 */
+	onWorkspaceDirectoriesChanged(cb: (previous: string[], next: string[]) => void): () => void {
+		this.#workspaceDirectoriesChangedCallbacks.add(cb);
+		return () => {
+			this.#workspaceDirectoriesChangedCallbacks.delete(cb);
 		};
 	}
 
@@ -3892,10 +3972,18 @@ export class SessionManager {
 	 * Create a new session.
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
+	 * @param options.additionalDirectories Workspace directories beyond cwd,
+	 * normalized and written into the header from the first persist.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		options?: { additionalDirectories?: string[] },
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
+		manager.#adoptAdditionalDirectories(options?.additionalDirectories ?? []);
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -3964,6 +4052,9 @@ export class SessionManager {
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
 		normalizeLoadedUsage(history);
 		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
+		// Inherit the source workspace (re-normalized against the fork cwd) so the
+		// new header carries it from the first write.
+		manager.#adoptAdditionalDirectories(sourceHeader?.additionalDirectories ?? []);
 		manager.#resetToNewSession(
 			{
 				parentSession: sourceHeader?.id,
@@ -4309,8 +4400,10 @@ export class SessionManager {
 	static inMemory(
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
+		options?: { additionalDirectories?: string[] },
 	): SessionManager {
 		const manager = new SessionManager(cwd, "", false, storage);
+		manager.#adoptAdditionalDirectories(options?.additionalDirectories ?? []);
 		manager.#resetToNewSession();
 		return manager;
 	}

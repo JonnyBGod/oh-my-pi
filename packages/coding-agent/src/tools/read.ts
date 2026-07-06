@@ -125,6 +125,7 @@ import {
 	findSuffixMatchCached,
 	isNotFoundError,
 	isRemoteMountPath,
+	resolveInWorkspaceDirectories,
 	type SuffixMatchCache,
 } from "./read-path-resolution";
 import { type PdfImageReadTarget, renderPdfPageScreenshot, splitPdfImageReadPath } from "./read-pdf";
@@ -1462,7 +1463,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		buffered: BufferedFileText | undefined,
 		parsed: ParsedSelector,
 		displayMode: { hashLines: boolean; lineNumbers: boolean },
-		suffixResolution: { from: string; to: string } | undefined,
+		suffixResolution: { from: string; to: string; via?: string } | undefined,
 		signal: AbortSignal | undefined,
 		allowBridge = true,
 	): Promise<{
@@ -1489,7 +1490,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					raw: rawSelector,
 				});
 				if (suffixResolution) {
-					const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
+					const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via ${suffixResolution.via ?? "suffix match"}]`;
 					const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
 					if (firstText) firstText.text = `${notice}\n${firstText.text}`;
 				}
@@ -1844,7 +1845,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				: parseSel(localTarget.sel);
 
 		let absolutePath = await resolveReadPathAsync(localReadPath, this.session.cwd);
-		let suffixResolution: { from: string; to: string } | undefined;
+		let suffixResolution: { from: string; to: string; via?: string } | undefined;
 
 		let isDirectory = false;
 		let fileSize = 0;
@@ -1902,6 +1903,20 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 							// The referenced plan disappeared after resolution; continue through
 							// the ordinary delimited-path fallback and not-found error.
 						}
+					}
+				}
+
+				if (!recoveredApprovedPlan && !suffixResolution) {
+					const workspaceMatch = await resolveInWorkspaceDirectories(this.session, localReadPath, absolutePath);
+					if (workspaceMatch) {
+						absolutePath = workspaceMatch.absolutePath;
+						fileSize = workspaceMatch.size;
+						isDirectory = workspaceMatch.isDirectory;
+						suffixResolution = {
+							from: localReadPath,
+							to: workspaceMatch.absolutePath,
+							via: "workspace directory",
+						};
 					}
 				}
 
@@ -2241,7 +2256,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 								raw: isRawSelector(sel),
 							});
 							if (suffixResolution) {
-								const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
+								const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via ${suffixResolution.via ?? "suffix match"}]`;
 								const firstText = bridgeResult.content.find((c): c is TextContent => c.type === "text");
 								if (firstText) firstText.text = `${notice}\n${firstText.text}`;
 							}
@@ -2636,7 +2651,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (suffixResolution) {
 			details.suffixResolution = suffixResolution;
 			// Inline resolution notice into first text block so the model sees the actual path
-			const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via suffix match]`;
+			const notice = `[Path '${suffixResolution.from}' not found; resolved to '${suffixResolution.to}' via ${suffixResolution.via ?? "suffix match"}]`;
 			const firstText = content.find((c): c is TextContent => c.type === "text");
 			if (firstText) {
 				firstText.text = `${notice}\n${firstText.text}`;
@@ -2668,7 +2683,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	 */
 	async #readFileConflicts(
 		absolutePath: string,
-		suffixResolution: { from: string; to: string } | undefined,
+		suffixResolution: { from: string; to: string; via?: string } | undefined,
 		signal: AbortSignal | undefined,
 	): Promise<AgentToolResult<ReadToolDetails>> {
 		throwIfAborted(signal);

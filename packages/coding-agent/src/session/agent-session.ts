@@ -171,6 +171,7 @@ import { InternalUrlRouter, type LocalProtocolOptions } from "../internal-urls";
 import { type ChainJudge, hasNativeJudge, journalJudgmentUsage, resolveJudge, sharedJudgmentCache } from "../judgment";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { DaemonCompletionNotification } from "../launch/protocol";
+import { shutdownClientsForRoot } from "../lsp/client";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { MAGIC_KEYWORDS, type MagicKeywordContext, type MagicKeywordId } from "../modes/magic-keywords";
@@ -2454,6 +2455,20 @@ export class AgentSession implements SettingsScope {
 		// its refreshed same-selector entry (#10488) once discovery settles.
 		void this.#retryInactiveAdvisorAfterModelDiscovery();
 		void this.#revalidateFallbackChainsAfterModelDiscovery();
+		// Tear down LSP clients for roots dropped from the workspace mid-session
+		// (`/remove-dir`). Adds are left to lazy spawn on first use. LSP clients
+		// are module-global and keyed by root, so this only needs the removed set.
+		this.addDisposer(
+			this.sessionManager.onWorkspaceDirectoriesChanged((previous, next) => {
+				const retained = new Set(next);
+				for (const root of previous) {
+					if (retained.has(root)) continue;
+					void shutdownClientsForRoot(root).catch(err => {
+						logger.debug("LSP: workspace-root client shutdown failed", { root, error: String(err) });
+					});
+				}
+			}),
+		);
 		if (config.rebindModelAfterDiscovery) void this.#rebindActiveModelAfterModelDiscovery();
 		this.#watchWorkspaceAndPowerSettings();
 		this.#watchSessionSettings();

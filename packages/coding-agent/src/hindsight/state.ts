@@ -242,6 +242,12 @@ export class HindsightSessionState {
 	mentalModelsLoadPromise?: Promise<void>;
 	#mentalModelsLoadGeneration = 0;
 	unsubscribe?: () => void;
+	/**
+	 * Releases the {@link SessionManager.onWorkspaceDirectoriesChanged}
+	 * subscription that rebuilds the primary state when workspace roots change
+	 * mid-session (`/add-dir`, `/remove-dir`). Only set on primary states.
+	 */
+	unsubscribeWorkspace?: () => void;
 	/** Alias states delegate persistence config to a primary parent state. */
 	aliasOf?: HindsightSessionState;
 	readonly retainQueue: HindsightRetainQueue;
@@ -606,6 +612,8 @@ export class HindsightSessionState {
 		this.#mentalModelsLoadGeneration++;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.unsubscribeWorkspace?.();
+		this.unsubscribeWorkspace = undefined;
 		this.retainQueue.dispose();
 	}
 
