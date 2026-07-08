@@ -52,6 +52,7 @@ export const taskItemSchema = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"+": "delete",
 });
 const taskItemSchemaIsolated = type({
@@ -61,6 +62,7 @@ const taskItemSchemaIsolated = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -72,6 +74,7 @@ export const taskSchema = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"isolated?": "boolean",
 	"+": "delete",
 });
@@ -82,6 +85,7 @@ const taskSchemaNoIsolation = type({
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
 	"tools?": "string[]",
+	"cwd?": "string",
 	"+": "delete",
 });
 const taskSchemaBatch = type({
@@ -132,6 +136,7 @@ function createTaskSchema(options: {
 				"outputSchema?": outputSchemaInputSchema,
 				"schemaMode?": '"permissive" | "strict"',
 				...toolsField,
+				"cwd?": "string",
 				"isolated?": "boolean",
 				"+": "delete",
 			});
@@ -149,6 +154,7 @@ function createTaskSchema(options: {
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
+			"cwd?": "string",
 			"+": "delete",
 		});
 		return type.raw({
@@ -166,6 +172,7 @@ function createTaskSchema(options: {
 			"outputSchema?": outputSchemaInputSchema,
 			"schemaMode?": '"permissive" | "strict"',
 			...toolsField,
+			"cwd?": "string",
 			"isolated?": "boolean",
 			"+": "delete",
 		});
@@ -178,6 +185,7 @@ function createTaskSchema(options: {
 		"outputSchema?": outputSchemaInputSchema,
 		"schemaMode?": '"permissive" | "strict"',
 		...toolsField,
+		"cwd?": "string",
 		"+": "delete",
 	});
 }
