@@ -87,6 +87,13 @@ export interface StructuredSubagentRequest {
 	assignment: string;
 	/** Parent workspace directories beyond its cwd, inherited by the subagent; never the parent cwd. */
 	additionalDirectories?: string[];
+	/**
+	 * Per-invocation scoped working directory. When set, it replaces `session.cwd`
+	 * as the child's cwd, empties its inherited `additionalDirectories` (the child
+	 * runs scoped to this one root), and roots any isolation worktree at the repo
+	 * containing it. Callers must validate it lies within the session workspace.
+	 */
+	cwd?: string;
 	context?: string;
 	agent?: string;
 	model?: string | string[];
@@ -405,8 +412,10 @@ function buildExecutorOptions(
 	const restrictToolNames = policy.planMode || session.restrictToolNames === true;
 	const enableMCP = !restrictToolNames && (session.enableMCP ?? true);
 	return {
-		cwd: session.cwd,
-		additionalDirectories: request.additionalDirectories,
+		// A scoped `request.cwd` overrides the session cwd and empties inherited
+		// roots: the child runs as if launched in that one directory.
+		cwd: request.cwd ?? session.cwd,
+		additionalDirectories: request.cwd !== undefined ? [] : request.additionalDirectories,
 		getApiKey: session.getApiKey,
 		agent: policy.effectiveAgent,
 		task: renderSubagentPrompt(request.assignment),
@@ -600,7 +609,10 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		let isolationContext: IsolationContext | null = null;
 		if (policy.isIsolated) {
 			try {
-				isolationContext = await prepareIsolationContext(request.session.cwd);
+				// Root the worktree at the git repo containing the (possibly scoped)
+				// cwd, so an isolated + scoped spawn checks out the scoped repo
+				// rather than the parent session repo.
+				isolationContext = await prepareIsolationContext(request.cwd ?? request.session.cwd);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				throw new StructuredSubagentError(

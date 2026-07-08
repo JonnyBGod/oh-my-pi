@@ -13,6 +13,7 @@
  *   - Progress tracking via JSON events
  *   - Session artifacts for debugging
  */
+import { realpathSync, type Stats, statSync } from "node:fs";
 import path from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
@@ -45,6 +46,7 @@ import "../tools/review";
 import { AsyncJobError, type AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
+import { normalizeWorkspaceDirectory, workspaceRootForPath } from "../session/session-workspace";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
 import { createEvalCustomTools, describeEvalTools, evalToolsEnabled } from "./eval-tools";
 import { generateTaskName } from "./name-generator";
@@ -294,6 +296,13 @@ function spawnParamsFor(params: TaskParams, item: TaskItem, defaultAgent: string
 	if ("schemaMode" in item) spawn.schemaMode = item.schemaMode;
 	if ("tools" in item) spawn.tools = item.tools;
 	if ("effort" in item) spawn.effort = item.effort;
+	// `cwd` mirrors `isolated`: the batch item carries its own (per-spawn scope),
+	// the flat form carries it top-level. Item wins; top-level is the fallback.
+	if (item.cwd !== undefined) {
+		spawn.cwd = item.cwd;
+	} else if (params.cwd !== undefined) {
+		spawn.cwd = params.cwd;
+	}
 	if (item.isolated !== undefined) {
 		spawn.isolated = item.isolated;
 	} else if ("isolated" in params) {
@@ -359,6 +368,63 @@ function mergeSyncPayloads(
 		outputPaths: outputPaths.length > 0 ? outputPaths : undefined,
 		projectAgentsDir,
 	};
+}
+
+/** Sentinel returned by {@link workspaceRootForPath} when a path is inside no
+ *  workspace root. `\0` can never appear in a real filesystem path, so a hit is
+ *  unambiguous. */
+const OUT_OF_WORKSPACE_SENTINEL = "\0";
+
+/** Realpath-normalize `p` (collapsing symlinks like macOS `/tmp` → `/private/tmp`),
+ *  falling back to the lexical path when it doesn't exist yet. */
+function realpathOrSelf(p: string): string {
+	try {
+		return realpathSync.native(p);
+	} catch {
+		return p;
+	}
+}
+
+/** True when `candidate` sits inside one of `roots`. Compares lexically first,
+ *  then via realpath on both sides so symlink-collapsed roots match either way
+ *  (mirrors the plan-mode-guard containment idiom). */
+function isWithinWorkspace(candidate: string, roots: string[]): boolean {
+	if (workspaceRootForPath(candidate, roots, OUT_OF_WORKSPACE_SENTINEL) !== OUT_OF_WORKSPACE_SENTINEL) {
+		return true;
+	}
+	const realCandidate = realpathOrSelf(candidate);
+	const realRoots = roots.map(realpathOrSelf);
+	return workspaceRootForPath(realCandidate, realRoots, OUT_OF_WORKSPACE_SENTINEL) !== OUT_OF_WORKSPACE_SENTINEL;
+}
+
+/**
+ * Resolve and validate a subagent `cwd` request against the session workspace.
+ *
+ * Expands `~`/relative input against `session.cwd`, then rejects the request
+ * (throwing a clear {@link Error}) when the target is outside every workspace
+ * root or is not an existing directory. Symlink equivalence is handled during
+ * the containment check. Returns the normalized absolute path — the caller
+ * scopes the child to it (and empties its inherited roots).
+ */
+export function resolveSubagentCwd(session: ToolSession, requested: string): string {
+	const roots = session.directories ?? [session.cwd];
+	const normalized = normalizeWorkspaceDirectory(requested, session.cwd);
+	if (!isWithinWorkspace(normalized, roots)) {
+		throw new Error(
+			`Task cwd '${requested}' (resolved to '${normalized}') is outside the session workspace. ` +
+				`It must be within one of: ${roots.join(", ")}.`,
+		);
+	}
+	let stat: Stats;
+	try {
+		stat = statSync(normalized);
+	} catch {
+		throw new Error(`Task cwd '${requested}' (resolved to '${normalized}') is not an existing directory.`);
+	}
+	if (!stat.isDirectory()) {
+		throw new Error(`Task cwd '${requested}' (resolved to '${normalized}') is not a directory.`);
+	}
+	return normalized;
 }
 
 /** Generic worker agent types; several in one call usually means a more specific type exists. */
@@ -1458,6 +1524,27 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const assignment = (params.task ?? "").trim();
 		const context = this.#isBatchEnabled() ? params.context?.trim() || undefined : undefined;
 		let latestProgress: AgentProgress | undefined;
+
+		// A requested `cwd` scopes the child to that directory (behave "as if
+		// launched there"): validated to be within the session workspace, it
+		// becomes the child's cwd and the child does NOT inherit the parent's
+		// other roots (`buildExecutorOptions` empties them when `cwd` is set, and
+		// an isolated + scoped spawn roots its worktree at the scoped repo).
+		// Validation errors surface as a normal tool-error result. Omitting `cwd`
+		// preserves the parent's cwd + inherited roots.
+		let scopedCwd: string | undefined;
+		if (params.cwd !== undefined) {
+			try {
+				scopedCwd = resolveSubagentCwd(this.session, params.cwd);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				return {
+					content: [{ type: "text", text: message }],
+					details: { projectAgentsDir: null, results: [], totalDurationMs: Date.now() - startTime },
+				};
+			}
+		}
+
 		try {
 			const execution = await runStructuredSubagent({
 				session: this.session,
@@ -1480,6 +1567,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				// path did not pre-reserve one. Do not treat it as a HUD description.
 				identity: { id: preAllocatedId, label: params.name },
 				additionalDirectories: this.session.directories?.filter(directory => directory !== this.session.cwd),
+				...(scopedCwd !== undefined ? { cwd: scopedCwd } : {}),
 				index: spawnIndex,
 				parentToolCallId: toolCallId,
 				detached,

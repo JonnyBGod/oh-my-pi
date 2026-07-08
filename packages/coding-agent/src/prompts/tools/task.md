@@ -34,6 +34,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
   - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
   - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+  - `cwd`: Optional dir within the session workspace to scope this subagent to (runs as if launched there; LSP/roots use it; other roots not inherited).
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
   - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
@@ -53,6 +54,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 - `outputSchema`: Invocation-specific JSON Schema. Overrides the selected agent and parent-session schemas.
 - `schemaMode`: `"permissive"` (default) accepts a retry-exhausted invalid result with a warning; `"strict"` fails it.
+- `cwd`: Optional dir within the session workspace to scope the subagent to (runs as if launched there; LSP/roots use it; other roots not inherited).
 {{#if isolationEnabled}}
 {{#if applyIsolatedChanges}}
 - `isolated`: Run in a dedicated worktree; successful changes are automatically applied to the parent checkout.
