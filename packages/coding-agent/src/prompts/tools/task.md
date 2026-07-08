@@ -15,6 +15,7 @@ Shared edits need one integration owner{{#if ircEnabled}}; siblings coordinate v
 {{#if evalToolsEnabled}}`tools`: eval-defined, run in your kernel.
 {{/if}}{{#if effortEnabled}}`effort`: `"lo"`|`"med"`|`"hi"` by how open-ended the problem is.
 {{/if}}`schemaMode`: default permissive warns after retries; strict fails.
+`cwd`: Optional dir within the session workspace; runs as if launched there, uses it for LSP/roots, and does not inherit other roots.
 {{#if isolationEnabled}}{{#if applyIsolatedChanges}}`isolated`: worktree; successful changes apply to parent.
 {{else}}`isolated`: worktree; changes retained, not applied.
 {{/if}}{{/if}}Children start blank;{{#if ircEnabled}} parent IRC steers immediately;{{/if}} large payloads via `local://<path>`, NEVER inline.
